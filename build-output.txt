@@ -1,0 +1,9 @@
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.33
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+-- Configuring done (0.8s)
+-- Generating done (0.2s)
+-- Build files have been written to: E:/proj/Nexus/build
+ninja: no work to do.
