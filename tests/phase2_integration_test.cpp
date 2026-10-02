@@ -68,10 +68,10 @@ int main()
 {
     TempDirectory temp;
     nexus::app::Settings settings;
-    if (!Check(settings.presetTags().size() == 6,
+    if (!Check(settings.presetTags().size() == 2,
                "default preset tags were not installed") ||
-        !Check(settings.presetTags()[0] == "白丝" &&
-                   settings.presetTags()[5] == "内射",
+        !Check(settings.presetTags()[0] == "高效" &&
+                   settings.presetTags()[1] == "智斗",
                "default preset tag values are incorrect"))
     {
         return 1;
@@ -80,7 +80,7 @@ int main()
     settings.set_imageViewer(L"");
     settings.set_managedLibrary(L"D:\\NexusLibrary");
     settings.set_askMetadataOnDrop(false);
-    settings.set_presetTags({" 白丝 ", "自定义", "自定义", ""});
+    settings.set_presetTags({" 高效 ", "自定义", "自定义", ""});
     const std::filesystem::path settingsPath = temp.path() / L"nexus.toml";
     if (!Check(settings.Save(settingsPath), "settings save failed"))
     {
@@ -98,7 +98,7 @@ int main()
         !Check(!loadedSettings.askMetadataOnDrop(),
                "settings metadata prompt roundtrip failed") ||
         !Check(loadedSettings.presetTags() ==
-                   std::vector<std::string>{"白丝", "自定义"},
+                   std::vector<std::string>{"高效", "自定义"},
                "settings preset tags roundtrip failed"))
     {
         return 1;

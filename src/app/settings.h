@@ -38,8 +38,7 @@ private:
     // default; users can disable this in Settings.
     bool deleteSourceAfterImport_ = true;
     bool askMetadataOnDrop_ = true;
-    std::vector<std::string> presetTags_ = {
-        "白丝", "美少女", "萝莉", "3p", "肛交", "内射"};
+    std::vector<std::string> presetTags_ = {"高效", "智斗"};
 };
 
 }  // namespace nexus::app

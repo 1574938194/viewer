@@ -134,7 +134,7 @@ bool Settings::Load(const std::filesystem::path& file)
     managedLibrary_.clear();
     deleteSourceAfterImport_ = true;
     askMetadataOnDrop_ = true;
-    presetTags_ = {"白丝", "美少女", "萝莉", "3p", "肛交", "内射"};
+    presetTags_ = Settings().presetTags();
     bool presetTagsSeen = false;
     std::string line;
     while (std::getline(input, line))

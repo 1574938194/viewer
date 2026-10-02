@@ -153,7 +153,7 @@ constexpr int kBrowseNavigationIndex = 4;
 constexpr int kSidebarNavigationHeader = -2;
 constexpr int kSidebarTagsHeader = -3;
 
-// `vr "白丝 3p"` arrives as a raw command line; the shell quotes are not
+// `vr "高效 智斗"` arrives as a raw command line; the shell quotes are not
 // part of the query itself.
 std::wstring NormalizeQuery(const wchar_t* commandLine)
 {

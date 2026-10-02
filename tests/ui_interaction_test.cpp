@@ -41,14 +41,14 @@ std::vector<nexus::ResourceId> Ids(
 
 void TestTags()
 {
-  Check(nexus::ParseTags(L" Uniform, uniform ; 白丝， 白丝 ; , New ") ==
-            std::vector<std::string>({"Uniform", "白丝", "New"}),
+  Check(nexus::ParseTags(L" Uniform, uniform ; 高效， 高效 ; , New ") ==
+            std::vector<std::string>({"Uniform", "高效", "New"}),
         "tag parsing deduplication");
   Check(nexus::AppendTag(L" Uniform ", "uniform") == L" Uniform ",
         "duplicate click changed text");
-  Check(nexus::AppendTag(L"白丝", " Custom ") == L"白丝, Custom",
+  Check(nexus::AppendTag(L"高效", " Custom ") == L"高效, Custom",
         "new tag append");
-  Check(nexus::AppendTag(nexus::AppendTag(L"", "白丝"), "白丝") == L"白丝",
+  Check(nexus::AppendTag(nexus::AppendTag(L"", "高效"), "高效") == L"高效",
         "repeated tag click");
   const auto tags = nexus::UniqueTags(
       {" One ", "one", "二", "三", "四", "五", "六", "新增", " ", "二"});
@@ -214,7 +214,7 @@ void CALLBACK DriveModal(HWND, UINT, UINT_PTR timer, DWORD)
       SendMessageW(window, WM_COMMAND, MAKEWPARAM(300, BN_CLICKED), 0);
       SendMessageW(window, WM_COMMAND, MAKEWPARAM(300, BN_CLICKED), 0);
       GetWindowTextW(GetDlgItem(window, 103), text, 128);
-      Check(std::wstring(text) == L"白丝", "actual shortcut duplicated tag");
+      Check(std::wstring(text) == L"高效", "actual shortcut duplicated tag");
       SendMessageW(window, WM_COMMAND, MAKEWPARAM(111, BN_CLICKED), 0);
       GetWindowTextW(GetDlgItem(window, 300), text, 128);
       Check(std::wstring(text) == L"新增", "actual new preset button missing");
@@ -366,10 +366,10 @@ void TestModals(HWND owner)
     ArmModal(ModalAction::kTags);
     const auto result = nexus::ui::ImportDialog::Show(
         owner, {L"fixture.mp4"}, {},
-        {"白丝", "二", "三", "四", "五", "六", "新增"}, nullptr, edit);
+        {"高效", "二", "三", "四", "五", "六", "新增"}, nullptr, edit);
     Check(modal_checked && modal_ok,
           modal_error.empty() ? "tag modal not driven" : modal_error.c_str());
-    Check(result && result->tags == std::vector<std::string>({"白丝", "新增"}),
+    Check(result && result->tags == std::vector<std::string>({"高效", "新增"}),
           "actual Metadata tag result");
   }
 }
@@ -425,7 +425,7 @@ class ApplicationInteractionTest {
       app.tags_.Attach(resource.id, "示例标签");
     }
     app.settings_.set_presetTags(
-        {"白丝", "二", "三", "四", "五", "六", "新增"});
+        {"高效", "二", "三", "四", "五", "六", "新增"});
     app.ReloadFromDatabase();
     app.Refilter();
     app.searchBar_.set_on_text_changed([&app] { app.Refilter(); });
