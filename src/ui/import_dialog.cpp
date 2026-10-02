@@ -7,6 +7,7 @@
 
 #include "ui/dark_controls.h"
 #include "util/string_util.h"
+#include "util/tag_values.h"
 
 namespace nexus::ui {
 namespace {
@@ -16,6 +17,10 @@ constexpr int kCategoryId = 102;
 constexpr int kTagsId = 103;
 constexpr int kActorsId = 104;
 constexpr int kFavoriteId = 105;
+constexpr int kRecentTagBaseId = 300;
+constexpr int kPreviousTagsId = 110;
+constexpr int kNextTagsId = 111;
+constexpr int kTagPageId = 112;
 
 // Doubled layout constants relative to the original 520x430 dialog.
 constexpr int kWindowWidth = 1040;
@@ -87,11 +92,13 @@ public:
     const wchar_t* title = L"导入资源";
     const std::vector<std::filesystem::path>* files = nullptr;
     const std::vector<std::string>* categories = nullptr;
-    const std::vector<std::string>* recentTags = nullptr;
+    const std::vector<std::string>* quickTags = nullptr;
     std::optional<service::ImportMetadata> result;
     bool done = false;
     bool closeHover = false;
     bool tracking = false;
+    HWND tagEdit = nullptr;
+    std::size_t tagPage = 0;
 };
 
 HWND AddLabel(HWND parent, const wchar_t* text, int x, int y, int width,
@@ -134,6 +141,45 @@ HWND AddButton(HWND parent, const wchar_t* text, int id, int x, int y,
     return control;
 }
 
+void UpdateQuickTagPage(DialogState* state)
+{
+    const auto page = QuickTagPage(*state->quickTags, state->tagPage);
+    for (std::size_t slot = 0; slot < kQuickTagsPerPage; ++slot)
+    {
+        HWND button = GetDlgItem(state->window,
+                                 kRecentTagBaseId + static_cast<int>(slot));
+        const bool present = slot < page.size();
+        SetWindowTextW(button, present ? Utf8ToWide(page[slot]).c_str() : L"");
+        ShowWindow(button, present ? SW_SHOW : SW_HIDE);
+    }
+    const std::size_t pages = QuickTagPageCount(state->quickTags->size());
+    const std::wstring label = std::to_wstring(state->tagPage + 1) + L" / " +
+                               std::to_wstring(pages);
+    SetWindowTextW(GetDlgItem(state->window, kTagPageId), label.c_str());
+    EnableWindow(GetDlgItem(state->window, kPreviousTagsId), state->tagPage > 0);
+    EnableWindow(GetDlgItem(state->window, kNextTagsId), state->tagPage + 1 < pages);
+}
+
+void CloseImportWindow(HWND window, DialogState* state)
+{
+    if (window == nullptr || state == nullptr)
+    {
+        return;
+    }
+    state->done = true;
+    // Restore the owner before destroying the modal popup so activation never
+    // falls through to an unrelated Explorer window for a frame.
+    if (state->owner != nullptr && IsWindow(state->owner))
+    {
+        EnableWindow(state->owner, TRUE);
+        BringWindowToTop(state->owner);
+        SetForegroundWindow(state->owner);
+        SetActiveWindow(state->owner);
+    }
+    ShowWindow(window, SW_HIDE);
+    DestroyWindow(window);
+}
+
 LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
 {
     auto* state = reinterpret_cast<DialogState*>(
@@ -158,6 +204,10 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
+    case WM_NCACTIVATE:
+        // Keep the custom rounded frame stable while controls receive focus;
+        // the default non-client painter is not allowed to flash through.
+        return TRUE;
     case WM_NCHITTEST:
         return dark::BorderlessHitTest(hwnd, lp);
     case WM_MOUSEMOVE:
@@ -167,7 +217,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
         if (hover != state->closeHover)
         {
             state->closeHover = hover;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            dark::InvalidateCloseButton(hwnd);
         }
         if (!state->tracking)
         {
@@ -181,20 +231,52 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
         if (state->closeHover)
         {
             state->closeHover = false;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            dark::InvalidateCloseButton(hwnd);
         }
         return 0;
     case WM_LBUTTONDOWN:
         if (dark::CloseButtonHit(hwnd, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}))
         {
-            state->done = true;
-            DestroyWindow(hwnd);
+            CloseImportWindow(hwnd, state);
             return 0;
         }
         break;
     case WM_COMMAND:
     {
         const int command = LOWORD(wp);
+        if (HIWORD(wp) != BN_CLICKED)
+        {
+            return 0;
+        }
+        if (command == kPreviousTagsId || command == kNextTagsId)
+        {
+            const std::size_t pages = QuickTagPageCount(state->quickTags->size());
+            if (command == kPreviousTagsId && state->tagPage > 0)
+                --state->tagPage;
+            if (command == kNextTagsId && state->tagPage + 1 < pages)
+                ++state->tagPage;
+            UpdateQuickTagPage(state);
+            return 0;
+        }
+        if (command >= kRecentTagBaseId &&
+            command < kRecentTagBaseId + static_cast<int>(kQuickTagsPerPage) &&
+            state->tagEdit != nullptr &&
+            state->quickTags != nullptr)
+        {
+            const size_t index = state->tagPage * kQuickTagsPerPage +
+                static_cast<size_t>(command - kRecentTagBaseId);
+            if (index < state->quickTags->size())
+            {
+                const std::wstring value = AppendTag(
+                    ControlText(state->tagEdit), (*state->quickTags)[index]);
+                SetWindowTextW(state->tagEdit, value.c_str());
+                SetFocus(state->tagEdit);
+                SendMessageW(state->tagEdit, EM_SETSEL,
+                             static_cast<WPARAM>(-1),
+                             static_cast<LPARAM>(-1));
+            }
+            return 0;
+        }
         if (command == IDOK)
         {
             service::ImportMetadata metadata;
@@ -207,21 +289,19 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
                 category.clear();
             }
             metadata.category = WideToUtf8(category);
-            metadata.tags = SplitValues(
+            metadata.tags = ParseTags(
                 ControlText(GetDlgItem(hwnd, kTagsId)));
             metadata.actors = SplitValues(
                 ControlText(GetDlgItem(hwnd, kActorsId)));
             metadata.favorite = dark::IsChecked(
                 GetDlgItem(hwnd, kFavoriteId));
             state->result = std::move(metadata);
-            state->done = true;
-            DestroyWindow(hwnd);
+            CloseImportWindow(hwnd, state);
             return 0;
         }
         if (command == IDCANCEL)
         {
-            state->done = true;
-            DestroyWindow(hwnd);
+            CloseImportWindow(hwnd, state);
             return 0;
         }
         return 0;
@@ -256,8 +336,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
         return reinterpret_cast<LRESULT>(dark::HandleCtlColor(
             reinterpret_cast<HWND>(lp), reinterpret_cast<HDC>(wp), message));
     case WM_CLOSE:
-        state->done = true;
-        DestroyWindow(hwnd);
+        CloseImportWindow(hwnd, state);
         return 0;
     default:
         return DefWindowProcW(hwnd, message, wp, lp);
@@ -270,7 +349,7 @@ LRESULT CALLBACK DialogProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
 std::optional<service::ImportMetadata> ImportDialog::Show(
     HWND owner, const std::vector<std::filesystem::path>& files,
     const std::vector<std::string>& categories,
-    const std::vector<std::string>& recentTags,
+    const std::vector<std::string>& quickTags,
     const service::ImportMetadata* initial, bool editMode)
 {
     static bool registered = false;
@@ -295,7 +374,8 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
     state.title = editMode ? L"编辑资源" : L"导入资源";
     state.files = &files;
     state.categories = &categories;
-    state.recentTags = &recentTags;
+    const std::vector<std::string> uniqueQuickTags = UniqueTags(quickTags);
+    state.quickTags = &uniqueQuickTags;
     RECT ownerRect = {};
     GetWindowRect(owner, &ownerRect);
     const int x = ownerRect.left + std::max(
@@ -305,7 +385,7 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
         0, static_cast<int>((ownerRect.bottom - ownerRect.top) -
                             kWindowHeight) / 2);
     state.window = CreateWindowExW(
-        0, L"NexusImportDialog",
+        WS_EX_TOOLWINDOW, L"NexusImportDialog",
         editMode ? L"编辑资源" : L"导入资源",
         WS_POPUP | WS_SYSMENU, x, y, kWindowWidth, kWindowHeight, owner,
         nullptr, GetModuleHandleW(nullptr), &state);
@@ -322,7 +402,7 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
 
     const std::wstring summary = editMode
         ? L"编辑资源 Metadata"
-        : std::to_wstring(files.size()) + L" 个资源将归档到 Nexus";
+        : std::to_wstring(files.size()) + L" 个资源将归档到 Viewer";
     AddLabel(state.window, summary.c_str(), 40, 108, 960, 44);
     AddLabel(state.window, L"标题", 40, 180, 180, 44);
     HWND title = AddEdit(state.window, L"", kTitleId, 240, 172, 760,
@@ -372,6 +452,7 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
     AddLabel(state.window, L"标签", 40, 332, 180, 44);
     HWND tagEdit = AddEdit(state.window, L"", kTagsId, 240, 324, 760,
                            kRowHeight);
+    state.tagEdit = tagEdit;
     if (initial != nullptr)
     {
         std::wstring value;
@@ -385,14 +466,21 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
         }
         SetWindowTextW(tagEdit, value.c_str());
     }
-    std::wstring recent = L"最近：";
-    for (const std::string& item : recentTags)
+    AddLabel(state.window, L"快捷标签", 40, 384, 180, 40, true);
+    for (size_t i = 0; i < kQuickTagsPerPage; ++i)
     {
-        recent += Utf8ToWide(item) + L"  ";
+        const int buttonX = 240 + static_cast<int>(i) * 126;
+        AddButton(state.window, L"",
+                  kRecentTagBaseId + static_cast<int>(i), buttonX, 382, 114,
+                  40);
     }
-    AddLabel(state.window, recent.c_str(), 240, 386, 760, 40, true);
-    AddLabel(state.window, L"演员", 40, 440, 180, 44);
-    HWND actorEdit = AddEdit(state.window, L"", kActorsId, 240, 432, 760,
+    AddButton(state.window, L"上一页", kPreviousTagsId, 240, 432, 140, 40);
+    HWND tagPage = AddLabel(state.window, L"", 400, 432, 220, 40, true);
+    SetWindowLongPtrW(tagPage, GWLP_ID, kTagPageId);
+    AddButton(state.window, L"下一页", kNextTagsId, 640, 432, 140, 40);
+    UpdateQuickTagPage(&state);
+    AddLabel(state.window, L"演员", 40, 496, 180, 44);
+    HWND actorEdit = AddEdit(state.window, L"", kActorsId, 240, 488, 760,
                              kRowHeight);
     if (initial != nullptr)
     {
@@ -409,9 +497,10 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
     }
     HWND favorite = CreateWindowExW(
         0, L"BUTTON", L"收藏",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 240, 508, 240, 44,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 240, 556, 760, 44,
         state.window, ControlId(kFavoriteId), nullptr, nullptr);
     dark::StyleButton(favorite, true);
+    dark::MarkToggle(favorite);
     if (initial != nullptr && initial->favorite)
     {
         dark::SetChecked(favorite, true);
@@ -419,7 +508,7 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
     AddLabel(state.window,
              editMode ? L"保存将原子更新资源 Metadata。"
                       : L"确认后将在后台安全归档；成功前不会删除来源文件。",
-             40, 592, 960, 44, true);
+             40, 620, 960, 44, true);
     AddButton(state.window, L"取消", IDCANCEL, 620, 688, 180, 56);
     AddButton(state.window, editMode ? L"保存" : L"导入", IDOK, 820, 688, 180,
               56, true);
@@ -427,6 +516,10 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
 
     EnableWindow(owner, FALSE);
     ShowWindow(state.window, SW_SHOW);
+    SetWindowPos(state.window, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(state.window);
+    SetActiveWindow(state.window);
     MSG message = {};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0)
     {
@@ -437,7 +530,8 @@ std::optional<service::ImportMetadata> ImportDialog::Show(
         }
     }
     EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
+    BringWindowToTop(owner);
+    SetActiveWindow(owner);
     return state.result;
 }
 

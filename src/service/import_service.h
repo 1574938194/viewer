@@ -34,6 +34,15 @@ struct ImportMetadata {
     bool deleteSource = false;
 };
 
+// A concrete file queued for import together with tags inherited from the
+// directory it came from.  Directory drops use the directory name as one of
+// these inherited tags while regular file drops leave it empty.
+struct ImportItem
+{
+    std::filesystem::path path;
+    std::vector<std::string> inheritedTags;
+};
+
 // Background import pipeline (design doc sections 25, 29, 71): validate ->
 // archive (ArchiveService) -> database commit -> recycle source. Runs on a
 // worker thread; the UI is notified via a posted message when a batch
@@ -69,9 +78,22 @@ public:
 
     void Shutdown();
 
-    // Queues files dropped onto the window; invalid types are ignored.
+    // Queues files or directories dropped onto the window.  Directory inputs
+    // are expanded recursively by the worker; invalid types are ignored.
     void Import(std::vector<std::filesystem::path> files,
                 ImportMetadata metadata = {});
+
+    // Queues already-expanded files.  |inheritedTags| are added to each
+    // resource in addition to the metadata supplied for the batch.
+    void ImportItems(std::vector<ImportItem> items,
+                     ImportMetadata metadata = {});
+
+    // Expands directory inputs recursively into supported media files.  The
+    // top-level directory name is attached as an inherited tag for every file
+    // found below it.  Regular file inputs are preserved, including invalid
+    // or missing paths so Import() retains its skipped-file accounting.
+    static std::vector<ImportItem> ExpandInputs(
+        const std::vector<std::filesystem::path>& inputs);
 
     // Returns the resource type for a supported extension, or nullopt.
     static std::optional<ResourceType> Classify(
@@ -80,7 +102,7 @@ public:
 private:
     void WorkerLoop();
 
-    BatchResult ImportOne(const std::filesystem::path& file,
+    BatchResult ImportOne(const ImportItem& item,
                           const ImportMetadata& metadata,
                           repo::ResourceRepository& resources,
                           repo::TagRepository& tags,
@@ -97,7 +119,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     struct Request {
-        std::vector<std::filesystem::path> files;
+        std::vector<ImportItem> items;
         ImportMetadata metadata;
     };
     std::deque<Request> queue_;

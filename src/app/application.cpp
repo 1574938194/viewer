@@ -6,23 +6,28 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <utility>
 
+#include "app/icon_resource.h"
 #include "database/migration.h"
 #include "domain/sample_assets.h"
 #include "render/theme.h"
 #include "repository/category_repository.h"
 #include "repository/actor_repository.h"
 #include "service/delete_service.h"
+#include "service/media_probe.h"
 #include "service/search_service.h"
 #include "service/scan_service.h"
 #include "ui/import_dialog.h"
+#include "ui/delete_dialog.h"
 #include "ui/settings_dialog.h"
 #include "util/string_util.h"
+#include "util/tag_values.h"
 
 namespace nexus::app {
 
@@ -142,8 +147,13 @@ constexpr float kSortWidthDp = 220.0f;
 constexpr float kSidebarWidthDp = 236.0f;
 constexpr float kSideItemHeightDp = 36.0f;
 constexpr float kSideListTopDp = 44.0f;
+constexpr float kSideSectionGapDp = 12.0f;
+constexpr int kSidebarNavigationCount = 5;
+constexpr int kBrowseNavigationIndex = 4;
+constexpr int kSidebarNavigationHeader = -2;
+constexpr int kSidebarTagsHeader = -3;
 
-// `nx "白丝 3p"` arrives as a raw command line; the shell quotes are not
+// `vr "白丝 3p"` arrives as a raw command line; the shell quotes are not
 // part of the query itself.
 std::wstring NormalizeQuery(const wchar_t* commandLine)
 {
@@ -192,15 +202,98 @@ std::filesystem::path ModuleDir()
     return std::filesystem::path(buffer).parent_path();
 }
 
+std::vector<std::string> BuildQuickTags(
+    const Settings& settings, repo::TagRepository& tags)
+{
+    std::vector<std::string> quickTags = settings.presetTags();
+    for (const std::string& tag : tags.RecentTags(10))
+    {
+        if (std::find(quickTags.begin(), quickTags.end(), tag) ==
+            quickTags.end())
+        {
+            quickTags.push_back(tag);
+        }
+    }
+    return UniqueTags(quickTags);
+}
+
+std::string BrowsePathKey(const std::filesystem::path& path)
+{
+    return AsciiLower(WideToUtf8(path.lexically_normal().wstring()));
+}
+
+bool BrowsePathsEqual(const std::filesystem::path& left,
+                      const std::filesystem::path& right)
+{
+    return BrowsePathKey(left) == BrowsePathKey(right);
+}
+
+ResourceId BrowseSyntheticId(const std::filesystem::path& path)
+{
+    // Keep generated browse-only rows outside SQLite's AUTOINCREMENT range.
+    // FNV-1a is deterministic so the same folder keeps its identity while
+    // the user is navigating the current directory.
+    const std::string key = BrowsePathKey(path);
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char character : key)
+    {
+        hash ^= character;
+        hash *= 1099511628211ULL;
+    }
+    return (static_cast<ResourceId>(1) << 63) | (hash & 0x7fffffffffffffffULL);
+}
+
+bool BrowseTextMatches(const Resource& resource, const std::wstring& query)
+{
+    if (query.empty())
+    {
+        return true;
+    }
+    const std::string term = AsciiLower(WideToUtf8(query));
+    if (term.empty())
+    {
+        return true;
+    }
+    const auto contains = [&term](const std::string& value) {
+        return AsciiLower(value).find(term) != std::string::npos;
+    };
+    if (contains(resource.originalFilename) || contains(resource.title) ||
+        contains(resource.code) || contains(resource.categoryName))
+    {
+        return true;
+    }
+    for (const std::string& tag : resource.tags)
+    {
+        if (contains(tag))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int RunMaintenance(const std::wstring& command)
 {
     const std::filesystem::path exeDir = ModuleDir();
+    Settings settings;
+    settings.Load(exeDir / L"nexus.toml");
+    const std::filesystem::path libraryRoot =
+        settings.managedLibrary().empty()
+            ? exeDir / L"NexusLibrary"
+            : std::filesystem::path(settings.managedLibrary());
     db::Database database;
     const std::filesystem::path databasePath =
         exeDir / L"data" / L"nexus.db";
-    if (!database.Open(databasePath) || !db::Migrate(database))
+    if (!database.Open(databasePath))
     {
-        MessageBoxW(nullptr, L"无法打开数据库。", L"Nexus", MB_ICONERROR);
+        MessageBoxW(nullptr, L"无法打开数据库。", L"Viewer", MB_ICONERROR);
+        return 1;
+    }
+    if (!db::Migrate(database))
+    {
+        MessageBoxW(nullptr,
+                    L"数据库迁移失败。Viewer 需要带 FTS5 扩展的 SQLite。",
+                    L"Viewer", MB_ICONERROR);
         return 1;
     }
     if (command == L"--backup")
@@ -209,26 +302,26 @@ int RunMaintenance(const std::wstring& command)
         std::tm localTime = {};
         localtime_s(&localTime, &now);
         wchar_t name[64] = {};
-        swprintf(name, 64, L"nexus-backup-%04d%02d%02d-%02d%02d%02d.db",
+        swprintf(name, 64, L"viewer-backup-%04d%02d%02d-%02d%02d%02d.db",
                  localTime.tm_year + 1900, localTime.tm_mon + 1,
                  localTime.tm_mday, localTime.tm_hour, localTime.tm_min,
                  localTime.tm_sec);
         const std::filesystem::path backupPath = exeDir / L"data" / name;
         if (!database.BackupTo(backupPath))
         {
-            MessageBoxW(nullptr, L"数据库备份失败。", L"Nexus", MB_ICONERROR);
+            MessageBoxW(nullptr, L"数据库备份失败。", L"Viewer", MB_ICONERROR);
             return 1;
         }
         MessageBoxW(nullptr, (L"数据库已备份到：\n" +
                               backupPath.wstring())
                                  .c_str(),
-                     L"Nexus", MB_ICONINFORMATION);
+                     L"Viewer", MB_ICONINFORMATION);
         return 0;
     }
     if (command == L"--scan")
     {
         const service::ScanResult scan = service::ScanService::Run(
-            databasePath, exeDir / L"NexusLibrary");
+            databasePath, libraryRoot);
         MessageBoxW(nullptr,
                     (L"扫描完成。新增 " + std::to_wstring(scan.added) +
                      L"，跳过 " + std::to_wstring(scan.skipped) +
@@ -238,14 +331,14 @@ int RunMaintenance(const std::wstring& command)
                      std::to_wstring(scan.missingUpdated) +
                      L"，待处理临时文件 " + std::to_wstring(scan.incoming))
                         .c_str(),
-                    L"Nexus", scan.failed > 0 ? MB_ICONWARNING
+                    L"Viewer", scan.failed > 0 ? MB_ICONWARNING
                                                : MB_ICONINFORMATION);
         return scan.failed > 0 ? 1 : 0;
     }
     if (command == L"--recover")
     {
         const service::ScanResult scan = service::ScanService::Run(
-            databasePath, exeDir / L"NexusLibrary");
+            databasePath, libraryRoot);
         MessageBoxW(nullptr,
                     (L"恢复完成。新增 " + std::to_wstring(scan.added) +
                      L"，更新 " + std::to_wstring(scan.updated) +
@@ -255,13 +348,13 @@ int RunMaintenance(const std::wstring& command)
                      std::to_wstring(scan.incoming) +
                      L"。\n临时文件已保留，需人工检查。")
                         .c_str(),
-                    L"Nexus", scan.failed > 0 ? MB_ICONWARNING
+                    L"Viewer", scan.failed > 0 ? MB_ICONWARNING
                                                : MB_ICONINFORMATION);
         return scan.failed > 0 ? 1 : 0;
     }
     if (command == L"--export")
     {
-        const std::filesystem::path exportPath = exeDir / L"nexus-export.csv";
+        const std::filesystem::path exportPath = exeDir / L"viewer-export.csv";
         const std::filesystem::path temporary =
             exportPath.wstring() + L".tmp-" +
             std::to_wstring(GetCurrentProcessId());
@@ -269,7 +362,7 @@ int RunMaintenance(const std::wstring& command)
                              std::ios::binary | std::ios::trunc);
         if (!output)
         {
-            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Nexus",
+            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Viewer",
                         MB_ICONERROR);
             return 1;
         }
@@ -309,7 +402,7 @@ int RunMaintenance(const std::wstring& command)
             output.close();
             std::error_code cleanupError;
             std::filesystem::remove(temporary, cleanupError);
-            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Nexus",
+            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Viewer",
                         MB_ICONERROR);
             return 1;
         }
@@ -319,7 +412,7 @@ int RunMaintenance(const std::wstring& command)
         {
             std::error_code cleanupError;
             std::filesystem::remove(temporary, cleanupError);
-            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Nexus",
+            MessageBoxW(nullptr, L"Metadata 导出失败。", L"Viewer",
                         MB_ICONERROR);
             return 1;
         }
@@ -327,7 +420,7 @@ int RunMaintenance(const std::wstring& command)
                     (L"Metadata 已导出到：\n" +
                      exportPath.wstring())
                         .c_str(),
-                    L"Nexus", MB_ICONINFORMATION);
+                    L"Viewer", MB_ICONINFORMATION);
         return 0;
     }
 
@@ -373,7 +466,7 @@ int RunMaintenance(const std::wstring& command)
                  L"\n缺失：" + std::to_wstring(missing) +
                  L"\n数据库：" + databasePath.wstring())
                     .c_str(),
-                L"Nexus", MB_ICONINFORMATION);
+                L"Viewer", MB_ICONINFORMATION);
     return 0;
 }
 
@@ -391,7 +484,7 @@ public:
     }
 
 private:
-    static constexpr int kItemCount = 4;
+    static constexpr int kItemCount = 6;
 
     static LRESULT CALLBACK Proc(HWND hwnd, UINT message, WPARAM wp,
                                  LPARAM lp)
@@ -466,7 +559,11 @@ private:
             }
             return -1;
         }
-        ShowWindow(hwnd_, SW_SHOWNA);
+        // Activate the popup explicitly.  SW_SHOWNA leaves a WS_POPUP without
+        // keyboard/mouse activation on some Windows builds, which causes the
+        // first click to be delivered to the owner instead of selecting a
+        // sort row.
+        ShowWindow(hwnd_, SW_SHOW);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         MSG message = {};
@@ -497,6 +594,8 @@ private:
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_NCHITTEST:
+            return HTCLIENT;
         case WM_MOUSEMOVE:
         {
             const int row = RowFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -517,6 +616,8 @@ private:
             hover_ = -1;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        case WM_MOUSEACTIVATE:
+            return MA_ACTIVATE;
         case WM_LBUTTONDOWN:
         {
             const int row = RowFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -533,13 +634,26 @@ private:
                 selected_ = -1;
                 done_ = true;
             }
-            return 0;
-        case WM_ACTIVATE:
-            if (LOWORD(wp) == WA_INACTIVE)
+            else if (wp == VK_UP || wp == VK_DOWN)
             {
-                selected_ = -1;
+                const int direction = wp == VK_UP ? -1 : 1;
+                const int base = hover_ >= 0 ? hover_ : current_;
+                hover_ = std::clamp(base + direction, 0, kItemCount - 1);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (wp == VK_RETURN)
+            {
+                selected_ = hover_ >= 0 ? hover_ : current_;
                 done_ = true;
             }
+            return 0;
+        case WM_CLOSE:
+            selected_ = -1;
+            done_ = true;
+            return 0;
+        case WM_KILLFOCUS:
+            selected_ = -1;
+            done_ = true;
             return 0;
         default:
             return DefWindowProcW(hwnd, message, wp, lp);
@@ -561,7 +675,8 @@ private:
     void Draw()
     {
         static const wchar_t* kItems[kItemCount] = {
-            L"综合排序", L"最近打开", L"热度排序", L"最近添加"};
+            L"综合排序", L"最近打开", L"热度排序", L"最近添加",
+            L"创建时间", L"文件大小"};
         render::Renderer* painter = &renderer_;
         painter->Begin();
         painter->Clear(render::Theme::kPanel);
@@ -620,14 +735,14 @@ int Application::Run(const wchar_t* commandLine)
     if (normalized == L"--help" || normalized == L"-h")
     {
         MessageBoxW(nullptr,
-                    L"Nexus\n\n"
-                    L"nx [关键词]        搜索资源\n"
-                    L"nx --db-info       查看数据库统计\n"
-                    L"nx --backup        备份数据库\n"
-                    L"nx --scan          扫描托管库并恢复索引\n"
-                    L"nx --recover       恢复托管库索引并统计未完成导入\n"
-                    L"nx --export        导出 Metadata CSV",
-                    L"Nexus", MB_ICONINFORMATION);
+                    L"Viewer (VR)\n\n"
+                    L"vr [关键词]        搜索资源\n"
+                    L"vr --db-info       查看数据库统计\n"
+                    L"vr --backup        备份数据库\n"
+                    L"vr --scan          扫描托管库并恢复索引\n"
+                    L"vr --recover       恢复托管库索引并统计未完成导入\n"
+                    L"vr --export        导出 Metadata CSV",
+                    L"Viewer", MB_ICONINFORMATION);
         return 0;
     }
     if (normalized == L"--backup" || normalized == L"--db-info" ||
@@ -638,8 +753,8 @@ int Application::Run(const wchar_t* commandLine)
     }
     if (normalized.starts_with(L"--"))
     {
-        MessageBoxW(nullptr, L"未知命令。使用 nx --help 查看可用命令。",
-                    L"Nexus", MB_ICONWARNING);
+        MessageBoxW(nullptr, L"未知命令。使用 vr --help 查看可用命令。",
+                    L"Viewer", MB_ICONWARNING);
         return 2;
     }
 
@@ -679,6 +794,11 @@ bool Application::Init(const std::wstring& initialQuery)
     }
     comInitialized_ = true;
     settings_.Load(exeDir_ / L"nexus.toml");
+    libraryRoot_ = settings_.managedLibrary().empty()
+        ? exeDir_ / L"NexusLibrary"
+        : std::filesystem::path(settings_.managedLibrary());
+    browsePath_ = libraryRoot_;
+    archive_.SetLibraryRoot(libraryRoot_);
 
     WNDCLASSEXW windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
@@ -686,13 +806,18 @@ bool Application::Init(const std::wstring& initialQuery)
     windowClass.lpfnWndProc = WndProc;
     windowClass.hInstance = GetModuleHandleW(nullptr);
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hIcon = LoadIconW(windowClass.hInstance,
+                                 MAKEINTRESOURCEW(IDI_VIEWER));
+    windowClass.hIconSm = static_cast<HICON>(LoadImageW(
+        windowClass.hInstance, MAKEINTRESOURCEW(IDI_VIEWER), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = L"NexusMainWindow";
     RegisterClassExW(&windowClass);
 
-    hwnd_ = CreateWindowExW(0, windowClass.lpszClassName, L"Nexus",
+    hwnd_ = CreateWindowExW(0, windowClass.lpszClassName, L"Viewer",
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                            1360, 860, nullptr, nullptr, windowClass.hInstance,
+                            1960, 1080, nullptr, nullptr, windowClass.hInstance,
                             nullptr);
     if (hwnd_ == nullptr)
     {
@@ -719,10 +844,18 @@ bool Application::Init(const std::wstring& initialQuery)
         return false;
     }
 
-    if (!database_.Open(exeDir_ / L"data" / L"nexus.db") ||
-        !db::Migrate(database_))
+    const std::filesystem::path databasePath =
+        exeDir_ / L"data" / L"nexus.db";
+    if (!database_.Open(databasePath))
     {
-        MessageBoxW(hwnd_, L"无法打开数据库。", L"Nexus", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"无法打开数据库。", L"Viewer", MB_ICONERROR);
+        return false;
+    }
+    if (!db::Migrate(database_))
+    {
+        MessageBoxW(hwnd_,
+                    L"数据库迁移失败。Viewer 需要带 FTS5 扩展的 SQLite。",
+                    L"Viewer", MB_ICONERROR);
         return false;
     }
 
@@ -732,9 +865,6 @@ bool Application::Init(const std::wstring& initialQuery)
                       exeDir_ / L"cache" / L"thumbnails");
     importer_.Start(hwnd_, kImportDoneMsg, kImportProgressMsg);
     deleter_.Start(hwnd_, kDeleteDoneMsg);
-    stopMissingWorker_ = false;
-    missingWorker_ = std::thread([this] { MissingWorkerLoop(); });
-    SeedEmptyLibrary();
     DragAcceptFiles(hwnd_, TRUE);
 
     searchBar_.set_on_text_changed([this] { Refilter(); });
@@ -747,15 +877,33 @@ bool Application::Init(const std::wstring& initialQuery)
     Refilter();
     ShowWindow(hwnd_, SW_SHOW);
     SetTimer(hwnd_, kCaretTimer, 530, nullptr);
+    // Let the first frame paint before generating demo assets. Real
+    // installations with an existing database do no seed work here.
+    PostMessageW(hwnd_, kSeedMsg, 0, 0);
     return true;
 }
 
 void Application::Shutdown()
 {
+    EndDragSelection(true);
     if (hwnd_ != nullptr)
     {
         KillTimer(hwnd_, kCaretTimer);
         DragAcceptFiles(hwnd_, FALSE);
+    }
+    if (seedWorker_.joinable())
+    {
+        seedWorker_.join();
+    }
+    stopLibraryScanWorker_ = true;
+    if (libraryScanWorker_.joinable())
+    {
+        libraryScanWorker_.join();
+    }
+    stopMissingWorker_ = true;
+    if (missingWorker_.joinable())
+    {
+        missingWorker_.join();
     }
     importer_.Shutdown();
     deleter_.Shutdown();
@@ -835,15 +983,39 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         // caption so native dragging, double-click maximize and Aero Snap
         // (edge docking) keep working.
         const LRESULT hit = DefWindowProcW(hwnd_, msg, wp, lp);
-        if (hit != HTCLIENT && hit != HTNOWHERE && hit != HTTRANSPARENT)
-        {
-            return hit;
-        }
         RECT client = {};
         GetClientRect(hwnd_, &client);
         POINT point = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &point);
         const float s = scale_;
+        const float titleHeight = kCaptionBarDp * s;
+        const float buttons = 3.0f * kCaptionButtonDp * s;
+        if (point.y >= 0 && point.y < static_cast<LONG>(titleHeight) &&
+            point.x >= client.right - static_cast<LONG>(buttons))
+        {
+            const float single = kCaptionButtonDp * s;
+            const bool overMaximize =
+                point.x >= client.right - static_cast<LONG>(2.0f * single) &&
+                point.x < client.right - static_cast<LONG>(single);
+            return overMaximize ? HTMAXBUTTON : HTCLIENT;
+        }
+        // The scrollbar is painted inside the right client edge. Keep its
+        // generous mouse target in the client hit-test region instead of
+        // letting the resize border consume the drag gesture.
+        const D2D1_RECT_F content = ContentRect();
+        const float scrollHitWidth = 14.0f * s;
+        if (CardScrollThumbRect().has_value() &&
+            point.x >= static_cast<LONG>(content.right - scrollHitWidth) &&
+            point.x < static_cast<LONG>(content.right) &&
+            point.y >= static_cast<LONG>(content.top) &&
+            point.y < static_cast<LONG>(content.bottom))
+        {
+            return HTCLIENT;
+        }
+        if (hit != HTCLIENT && hit != HTNOWHERE && hit != HTTRANSPARENT)
+        {
+            return hit;
+        }
         if (!IsZoomed(hwnd_))
         {
             const int border = std::max(6, static_cast<int>(8.0f * s));
@@ -860,20 +1032,10 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
         }
-        const float titleHeight = kCaptionBarDp * s;
         const float navigationBottom = (kCaptionBarDp + kTopBarDp) * s;
         if (point.y >= navigationBottom)
         {
             return HTCLIENT;
-        }
-        const float buttons = 3.0f * kCaptionButtonDp * s;
-        if (point.x >= client.right - static_cast<LONG>(buttons))
-        {
-            const float single = kCaptionButtonDp * s;
-            const bool overMaximize =
-                point.x >= client.right - static_cast<LONG>(2.0f * single) &&
-                point.x < client.right - static_cast<LONG>(single);
-            return overMaximize ? HTMAXBUTTON : HTCLIENT;
         }
         const D2D1_RECT_F search = SearchRect();
         if (point.x >= static_cast<LONG>(search.left) &&
@@ -914,6 +1076,7 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         SetHeaderHover(-1);
         return 0;
     case WM_SIZE:
+        EndDragSelection(true);
         if (wp != SIZE_MINIMIZED)
         {
             renderer_.Resize(LOWORD(lp), HIWORD(lp));
@@ -950,6 +1113,11 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         switch (wp)
         {
         case VK_ESCAPE:
+            if (selectionDrag_.active())
+            {
+                EndDragSelection(true);
+                return 0;
+            }
             if (searchBar_.focused() && !searchBar_.text().empty())
             {
                 searchBar_.Clear();
@@ -1044,8 +1212,18 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEMOVE:
     {
         POINT point = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (draggingCardScroll_)
+        {
+            UpdateCardScrollFromPointer(static_cast<float>(point.y));
+            return 0;
+        }
+        if (selectionDrag_.active())
+        {
+            UpdateDragSelection(point);
+            return 0;
+        }
         UpdateHeaderHover(point);
-        const int tag = HitTestSideTag(point);
+        const int tag = HitTestSidebar(point);
         if (tag != sideHover_)
         {
             sideHover_ = tag;
@@ -1066,9 +1244,43 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         RECT client = {};
         GetClientRect(hwnd_, &client);
         const float s = scale_;
-        const int tag = HitTestSideTag(point);
-        if (tag >= 0)
+        const int sideItem = HitTestSidebar(point);
+        if (sideItem == kSidebarNavigationHeader)
         {
+            navigationExpanded_ = !navigationExpanded_;
+            ClampSideScroll();
+            Invalidate();
+            return 0;
+        }
+        if (sideItem == kSidebarTagsHeader)
+        {
+            tagsExpanded_ = !tagsExpanded_;
+            ClampSideScroll();
+            Invalidate();
+            return 0;
+        }
+        if (sideItem >= 0)
+        {
+            if (sideItem < kSidebarNavigationCount)
+            {
+                sidebarFilter_ = static_cast<SidebarFilter>(sideItem);
+                tagFilter_.clear();
+                if (sidebarFilter_ == SidebarFilter::kBrowse)
+                {
+                    browsePath_ = libraryRoot_;
+                    ReloadBrowseDirectory();
+                    searchBar_.Clear();
+                    searchBar_.SetFocus(false);
+                }
+                Refilter();
+                return 0;
+            }
+            const int tag = sideItem - kSidebarNavigationCount;
+            if (tag < 0 || tag >= static_cast<int>(sideTags_.size()))
+            {
+                return 0;
+            }
+            sidebarFilter_ = SidebarFilter::kAll;
             tagFilter_ = tagFilter_ == sideTags_[tag].name
                 ? std::string()
                 : sideTags_[tag].name;
@@ -1121,12 +1333,54 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             ChooseSortMode();
             return 0;
         }
+        if (const auto thumb = CardScrollThumbRect(); thumb.has_value())
+        {
+            const D2D1_RECT_F content = ContentRect();
+            const float hitWidth = 14.0f * s;
+            const bool overTrack =
+                point.x >= static_cast<LONG>(content.right - hitWidth) &&
+                point.x <= static_cast<LONG>(content.right) &&
+                point.y >= static_cast<LONG>(content.top) &&
+                point.y < static_cast<LONG>(content.bottom);
+            if (overTrack)
+            {
+                cardScrollDragOffset_ =
+                    std::clamp(static_cast<float>(point.y) - thumb->top,
+                               0.0f, thumb->bottom - thumb->top);
+                draggingCardScroll_ = true;
+                SetCapture(hwnd_);
+                UpdateCardScrollFromPointer(static_cast<float>(point.y));
+                return 0;
+            }
+        }
         searchBar_.SetFocus(false);
+        if (const auto favoriteId =
+                ui::ResourceGrid::HitTestFavorite(MakeView(ContentRect()), point);
+            favoriteId.has_value())
+        {
+            selectedId_ = *favoriteId;
+            selectedIds_.clear();
+            selectedIds_.insert(*favoriteId);
+            ToggleSelectedFavorite();
+            return 0;
+        }
         auto id = ui::ResourceGrid::HitTest(MakeView(ContentRect()), point);
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (!id.has_value())
         {
+            const D2D1_RECT_F content = ContentRect();
+            if (point.x >= static_cast<LONG>(content.left) &&
+                point.x < static_cast<LONG>(content.right) &&
+                point.y >= static_cast<LONG>(content.top) &&
+                point.y < static_cast<LONG>(content.bottom))
+            {
+                selectionDrag_.Begin(point, content, scrollY_, control,
+                                     selectedIds_, selectedId_);
+                SetCapture(hwnd_);
+                UpdateDragSelection(point);
+                return 0;
+            }
             if (!control && !shift)
             {
                 selectedId_ = 0;
@@ -1182,6 +1436,35 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         Invalidate();
         return 0;
     }
+    case WM_LBUTTONUP:
+    {
+        if (draggingCardScroll_)
+        {
+            draggingCardScroll_ = false;
+            cardScrollDragOffset_ = 0.0f;
+            if (GetCapture() == hwnd_)
+            {
+                ReleaseCapture();
+            }
+            return 0;
+        }
+        if (!selectionDrag_.active())
+        {
+            break;
+        }
+        UpdateDragSelection({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        EndDragSelection(false);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        EndDragSelection(true);
+        if (draggingCardScroll_)
+        {
+            draggingCardScroll_ = false;
+            cardScrollDragOffset_ = 0.0f;
+        }
+        break;
     case WM_LBUTTONDBLCLK:
     {
         POINT point = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1191,12 +1474,41 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             selectedId_ = *id;
             selectedIds_.clear();
             selectedIds_.insert(*id);
+            if (sidebarFilter_ == SidebarFilter::kBrowse)
+            {
+                for (const Resource& item : browseItems_)
+                {
+                    if (item.id != *id)
+                    {
+                        continue;
+                    }
+                    if (item.type == ResourceType::kFolder)
+                    {
+                        browsePath_ = item.path;
+                        ReloadBrowseDirectory();
+                        selectedId_ = 0;
+                        selectedIds_.clear();
+                        scrollY_ = 0.0f;
+                        Refilter();
+                    }
+                    else
+                    {
+                        // A browse-only media row may not have reached the
+                        // database yet. It is still directly openable.
+                        OpenResource(const_cast<Resource*>(&item));
+                    }
+                    break;
+                }
+            }
+            else
+            {
             for (Resource& candidate : items_)
             {
                 if (candidate.id == *id)
                 {
                     OpenResource(&candidate);
                 }
+            }
             }
         }
         return 0;
@@ -1217,17 +1529,36 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             id = ui::ResourceGrid::HitTest(
                 MakeView(ContentRect()), clientPoint);
         }
-        if (!id.has_value())
+        const bool blankArea = !id.has_value();
+        if (blankArea && sidebarFilter_ != SidebarFilter::kBrowse)
         {
+            // Folder creation is intentionally scoped to the Browse view;
+            // filtered media/tag views must remain read-only.
             return 0;
         }
-        selectedId_ = *id;
-        if (!selectedIds_.contains(*id))
+        if (blankArea)
         {
-            selectedIds_.clear();
-            selectedIds_.insert(*id);
+            POINT clientPoint = screenPoint;
+            ScreenToClient(hwnd_, &clientPoint);
+            const D2D1_RECT_F content = ContentRect();
+            if (clientPoint.x < static_cast<LONG>(content.left) ||
+                clientPoint.x >= static_cast<LONG>(content.right) ||
+                clientPoint.y < static_cast<LONG>(content.top) ||
+                clientPoint.y >= static_cast<LONG>(content.bottom))
+            {
+                return 0;
+            }
         }
-        Invalidate();
+        if (!blankArea)
+        {
+            selectedId_ = *id;
+            if (!selectedIds_.contains(*id))
+            {
+                selectedIds_.clear();
+                selectedIds_.insert(*id);
+            }
+            Invalidate();
+        }
         HMENU menu = CreatePopupMenu();
         if (menu == nullptr)
         {
@@ -1239,12 +1570,40 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         menuInfo.hbrBack = menuBrush;
         menuInfo.dwStyle = MNS_AUTODISMISS;
         SetMenuInfo(menu, &menuInfo);
-        AddDarkMenuItem(menu, kMenuOpen, L"打开");
-        AddDarkMenuItem(menu, kMenuBrowse, L"在资源管理器中浏览");
-        AddDarkMenuItem(menu, kMenuEditMetadata, L"编辑 Metadata");
-        AddDarkMenuItem(menu, kMenuFavorite, L"切换收藏");
-        AddDarkMenuSeparator(menu);
-        AddDarkMenuItem(menu, kMenuDelete, L"移到回收站");
+        bool folderCard = false;
+        if (!blankArea && sidebarFilter_ == SidebarFilter::kBrowse)
+        {
+            for (const Resource& item : browseItems_)
+            {
+                if (item.id == *id)
+                {
+                    folderCard = item.type == ResourceType::kFolder;
+                    break;
+                }
+            }
+        }
+        if (blankArea)
+        {
+            AddDarkMenuItem(menu, kMenuNewFolder, L"新建文件夹");
+        }
+        else if (folderCard)
+        {
+            // Synthetic Browse folders are not database resources. Expose
+            // only actions that are meaningful for them, rather than showing
+            // metadata/favorite/delete commands that cannot operate on their
+            // synthetic IDs.
+            AddDarkMenuItem(menu, kMenuOpen, L"打开");
+            AddDarkMenuItem(menu, kMenuBrowse, L"在资源管理器中浏览");
+        }
+        else
+        {
+            AddDarkMenuItem(menu, kMenuOpen, L"打开");
+            AddDarkMenuItem(menu, kMenuBrowse, L"在资源管理器中浏览");
+            AddDarkMenuItem(menu, kMenuEditMetadata, L"编辑 Metadata");
+            AddDarkMenuItem(menu, kMenuFavorite, L"切换收藏");
+            AddDarkMenuSeparator(menu);
+            AddDarkMenuItem(menu, kMenuDelete, L"移到回收站");
+        }
         const UINT command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_NONOTIFY, screenPoint.x,
             screenPoint.y, 0, hwnd_, nullptr);
@@ -1252,7 +1611,80 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         DeleteObject(menuBrush);
         switch (command)
         {
+        case kMenuNewFolder:
+        {
+            if (sidebarFilter_ == SidebarFilter::kBrowse &&
+                !BrowsePathsEqual(browsePath_, libraryRoot_))
+            {
+                statusMessage_ = L"只能在托管库根目录创建文件夹";
+                Invalidate();
+                break;
+            }
+            std::error_code error;
+            const std::filesystem::path parent =
+                sidebarFilter_ == SidebarFilter::kBrowse ? browsePath_
+                                                          : libraryRoot_;
+            std::filesystem::path folder = parent / L"新建文件夹";
+            for (int suffix = 2; std::filesystem::exists(folder, error);
+                 ++suffix)
+            {
+                error.clear();
+                folder = parent /
+                         (std::wstring(L"新建文件夹 ") +
+                          std::to_wstring(suffix));
+            }
+            if (std::filesystem::create_directories(folder, error) && !error)
+            {
+                Resource resource;
+                resource.type = ResourceType::kFolder;
+                resource.path = folder;
+                resource.originalFilename =
+                    WideToUtf8(folder.filename().wstring());
+                resource.title = resource.originalFilename;
+                resource.addedTime = static_cast<std::int64_t>(std::time(nullptr));
+                resource.modifiedTime = resource.addedTime;
+                if (database_.Exec("BEGIN;") && resources_.Insert(resource) &&
+                    database_.Exec("COMMIT;"))
+                {
+                    ReloadFromDatabase();
+                    if (sidebarFilter_ == SidebarFilter::kBrowse)
+                    {
+                        ReloadBrowseDirectory();
+                    }
+                    Refilter();
+                }
+                statusMessage_ = L"已创建文件夹：" + folder.filename().wstring();
+            }
+            else
+            {
+                statusMessage_ = L"创建文件夹失败";
+            }
+            Invalidate();
+            break;
+        }
         case kMenuOpen:
+            if (sidebarFilter_ == SidebarFilter::kBrowse)
+            {
+                for (const Resource& item : browseItems_)
+                {
+                    if (item.id != selectedId_)
+                    {
+                        continue;
+                    }
+                    if (item.type == ResourceType::kFolder)
+                    {
+                        browsePath_ = item.path;
+                        ReloadBrowseDirectory();
+                        selectedId_ = 0;
+                        selectedIds_.clear();
+                        scrollY_ = 0.0f;
+                        Refilter();
+                        return 0;
+                    }
+                    OpenResource(const_cast<Resource*>(&item));
+                    return 0;
+                }
+            }
             for (Resource& item : items_)
             {
                 if (item.id == selectedId_)
@@ -1263,6 +1695,17 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         case kMenuBrowse:
+            if (sidebarFilter_ == SidebarFilter::kBrowse)
+            {
+                for (const Resource& item : browseItems_)
+                {
+                    if (item.id == selectedId_)
+                    {
+                        BrowseInExplorer(item.path);
+                        return 0;
+                    }
+                }
+            }
             for (const Resource& item : items_)
             {
                 if (item.id == selectedId_)
@@ -1292,7 +1735,8 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         POINT point = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &point);
         const D2D1_RECT_F sidebar = SidebarRect();
-        if (point.x >= static_cast<LONG>(sidebar.left) &&
+        if (!selectionDrag_.active() &&
+            point.x >= static_cast<LONG>(sidebar.left) &&
             point.x < static_cast<LONG>(sidebar.right) &&
             point.y >= static_cast<LONG>(sidebar.top) &&
             point.y < static_cast<LONG>(sidebar.bottom))
@@ -1304,6 +1748,10 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         {
             scrollY_ -= static_cast<float>(delta) * 0.7f * scale_;
             ClampScroll();
+            if (selectionDrag_.active())
+            {
+                UpdateDragSelection(point);
+            }
         }
         Invalidate();
         return 0;
@@ -1330,17 +1778,21 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         DragFinish(drop);
         if (!files.empty())
         {
+            const std::vector<service::ImportItem> expanded =
+                service::ImportService::ExpandInputs(files);
+            std::vector<service::ImportItem> supportedItems;
             std::vector<std::filesystem::path> supported;
-            for (const std::filesystem::path& file : files)
+            for (const service::ImportItem& item : expanded)
             {
-                if (service::ImportService::Classify(file).has_value())
+                if (service::ImportService::Classify(item.path).has_value())
                 {
-                    supported.push_back(file);
+                    supported.push_back(item.path);
+                    supportedItems.push_back(item);
                 }
             }
             if (supported.empty())
             {
-                MessageBoxW(hwnd_, L"未发现支持的视频或图片。", L"Nexus",
+                MessageBoxW(hwnd_, L"未发现支持的视频或图片。", L"Viewer",
                             MB_ICONINFORMATION);
                 return 0;
             }
@@ -1350,22 +1802,42 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             {
                 categoryNames.push_back(category.name);
             }
-            auto metadata = ui::ImportDialog::Show(
-                hwnd_, supported, categoryNames, tags_.RecentTags(10));
+            std::optional<service::ImportMetadata> metadata;
+            if (settings_.askMetadataOnDrop())
+            {
+                const std::vector<std::string> quickTags =
+                    BuildQuickTags(settings_, tags_);
+                metadata = ui::ImportDialog::Show(
+                    hwnd_, supported, categoryNames, quickTags);
+            }
+            else
+            {
+                metadata = service::ImportMetadata{};
+            }
             if (metadata.has_value())
             {
                 metadata->deleteSource = settings_.deleteSourceAfterImport();
-                importer_.Import(std::move(supported),
-                                 std::move(*metadata));
+                importer_.ImportItems(std::move(supportedItems),
+                                      std::move(*metadata));
             }
         }
         return 0;
     }
     case kImportDoneMsg:
     {
+        const int imported = static_cast<int>(wp);
+        const int skipped = static_cast<int>(HIWORD(lp));
+        const int failed = static_cast<int>(LOWORD(lp));
+        statusMessage_ = L"导入完成：成功 " + std::to_wstring(imported) +
+                         L"，跳过 " + std::to_wstring(skipped) +
+                         L"，失败 " + std::to_wstring(failed);
         importProgress_ = {};
         ReloadFromDatabase();
         Refilter();
+        // Imported rows are already fully probed, but their thumbnails may
+        // not be on disk yet.  Let the same segmented startup pass discover
+        // and warm any newly added cache entries.
+        StartBackgroundBuild();
         Invalidate();
         return 0;
     }
@@ -1374,6 +1846,18 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
         Invalidate();
         return 0;
     case WM_TIMER:
+        if (wp == kSelectionTimer && selectionDrag_.active())
+        {
+            const float previous = scrollY_;
+            scrollY_ += selectionDrag_.ScrollStep(ContentRect(), scale_);
+            ClampScroll();
+            UpdateDragSelection(selectionDrag_.pointer());
+            if (scrollY_ == previous)
+            {
+                KillTimer(hwnd_, kSelectionTimer);
+                selectionTimerRunning_ = false;
+            }
+        }
         if (wp == kCaretTimer && searchBar_.TickCaret())
         {
             Invalidate();
@@ -1406,12 +1890,19 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
             const std::wstring message =
                 std::to_wstring(deleted) + L" 个资源已删除，" +
                 std::to_wstring(failed) + L" 个失败。";
-            MessageBoxW(hwnd_, message.c_str(), L"Nexus", MB_ICONWARNING);
+            statusMessage_ = message;
+            MessageBoxW(hwnd_, message.c_str(), L"Viewer", MB_ICONWARNING);
+        }
+        else
+        {
+            statusMessage_ = L"已删除 " + std::to_wstring(deleted) +
+                             L" 个资源";
         }
         return 0;
     }
     case WM_DPICHANGED:
     {
+        EndDragSelection(true);
         const UINT dpi = LOWORD(wp);
         if (dpi != 0)
         {
@@ -1433,7 +1924,40 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wp, LPARAM lp)
     case kThumbReadyMsg:
         Invalidate();
         return 0;
+    case kSeedMsg:
+        if (!missingWorker_.joinable())
+        {
+            stopMissingWorker_ = false;
+            missingWorker_ = std::thread([this] { MissingWorkerLoop(); });
+        }
+        SeedEmptyLibrary();
+        // Existing installations may already contain legacy rows with empty
+        // derived fields.  Begin the incremental scan only after the first
+        // frame has been shown so startup stays responsive.
+        StartBackgroundBuild();
+        return 0;
+    case kLibraryScanDoneMsg:
+        // The worker posts this message immediately before returning.  Do
+        // not join here: an older completion message can remain queued while
+        // a newer pass is starting, and joining would then freeze the UI on
+        // the newer (potentially large) pass.  StartBackgroundBuild(),
+        // Shutdown() and the next settings change perform the join safely.
+        ReloadFromDatabase();
+        Refilter();
+        statusMessage_ = L"托管文件夹索引已更新";
+        Invalidate();
+        return 0;
+    case kLibraryScanReadyMsg:
+        // The lightweight pass has committed path/title/type rows.  Refresh
+        // immediately so cards are visible while the worker continues with
+        // hashes, dimensions, durations and thumbnails.
+        ReloadFromDatabase();
+        Refilter();
+        statusMessage_ = L"文件已加载，正在后台构建缩略图和索引…";
+        Invalidate();
+        return 0;
     case WM_DESTROY:
+        EndDragSelection(true);
         PostQuitMessage(0);
         return 0;
     case WM_MEASUREITEM:
@@ -1511,9 +2035,12 @@ void Application::DrawFrame()
     const float topHeight = titleHeight + navHeight;
     renderer_.FillRect({0.0f, 0.0f, width, topHeight}, render::Theme::kPanel);
     const float titleHalf = 9.0f * s;
+    renderer_.DrawIcon(LoadIconW(GetModuleHandleW(nullptr),
+                                  MAKEINTRESOURCEW(IDI_VIEWER)),
+                       {14.0f * s, 10.0f * s, 38.0f * s, 34.0f * s});
     renderer_.DrawTextWide(
-        L"Nexus",
-        {16.0f * s, titleHeight / 2.0f - titleHalf, 140.0f * s,
+        L"Viewer",
+        {48.0f * s, titleHeight / 2.0f - titleHalf, 172.0f * s,
          titleHeight / 2.0f + titleHalf},
         render::TextRole::kTitle, render::Theme::kText);
     searchBar_.Layout(SearchRect());
@@ -1530,6 +2057,14 @@ void Application::DrawFrame()
     else if (sortMode_ == SortMode::kAdded)
     {
         sortLabel = L"最近添加  ▾";
+    }
+    else if (sortMode_ == SortMode::kCreated)
+    {
+        sortLabel = L"创建时间  ▾";
+    }
+    else if (sortMode_ == SortMode::kFileSize)
+    {
+        sortLabel = L"文件大小  ▾";
     }
     const float sortHalf = 8.0f * s;
     const D2D1_RECT_F sortRect = SortRect();
@@ -1551,7 +2086,10 @@ void Application::DrawFrame()
     {
         const float centerY = (content.top + content.bottom) / 2.0f;
         const wchar_t* message =
-            searchBar_.text().empty() ? L"资源库为空" : L"没有匹配的资源";
+            searchBar_.text().empty() && tagFilter_.empty() &&
+                    sidebarFilter_ == SidebarFilter::kAll
+                ? L"资源库为空"
+                : L"没有匹配的资源";
         const float textWidth = renderer_.MeasureTextWide(
             message, render::TextRole::kSecondary);
         const float centerX = std::max(
@@ -1566,22 +2104,13 @@ void Application::DrawFrame()
     else
     {
         const ui::GridView view = MakeView(content);
+        renderer_.PushRectClip(content);
         ui::ResourceGrid::Draw(&renderer_, view, &thumbnails_);
+        renderer_.PopRectClip();
 
-        const float total = ui::ResourceGrid::ContentHeight(view);
-        const float viewport = content.bottom - content.top;
-        if (total > viewport && total > 0.0f)
+        if (const auto thumb = CardScrollThumbRect(); thumb.has_value())
         {
-            const float thumbHeight =
-                std::max(30.0f * s, viewport * viewport / total);
-            const float maxScroll = total - viewport;
-            const float y =
-                content.top +
-                (viewport - thumbHeight) * (scrollY_ / maxScroll);
-            renderer_.FillRect({content.right - 5.0f * s, y,
-                                content.right - 2.0f * s,
-                                y + thumbHeight},
-                               render::Theme::kBorder);
+            renderer_.FillRect(*thumb, render::Theme::kBorder);
         }
     }
 
@@ -1644,20 +2173,33 @@ void Application::DrawFrame()
     }
     else
     {
-        std::string status = std::to_string(filtered_.size()) + " 个资源";
-        if (selectedIds_.size() > 1)
+        if (!statusMessage_.empty())
         {
-            status += " · 已选择 " + std::to_string(selectedIds_.size());
+            renderer_.DrawTextWide(
+                statusMessage_,
+                {8.0f * s, height - statusHeight, width * 0.66f, height},
+                render::TextRole::kStatus, render::Theme::kTextSecondary);
         }
-        renderer_.DrawTextUtf8(status,
-                               {8.0f * s, height - statusHeight, width * 0.5f,
-                                height},
-                               render::TextRole::kStatus,
-                               render::Theme::kTextSecondary);
+        else
+        {
+            std::string status = std::to_string(filtered_.size()) +
+                                  " 个资源";
+            if (selectedIds_.size() > 1)
+            {
+                status += " · 已选择 " +
+                          std::to_string(selectedIds_.size());
+            }
+            renderer_.DrawTextUtf8(
+                status,
+                {8.0f * s, height - statusHeight, width * 0.5f, height},
+                render::TextRole::kStatus,
+                render::Theme::kTextSecondary);
+        }
     }
 
     if (!renderer_.End())
     {
+        thumbnails_.ResetBitmaps();
         renderer_.Shutdown();
         renderer_.Init(hwnd_, scale_);
         Invalidate();
@@ -1666,14 +2208,168 @@ void Application::DrawFrame()
 
 void Application::ReloadFromDatabase()
 {
+    EndDragSelection(true);
     items_ = resources_.LoadAll();
+    if (sidebarFilter_ == SidebarFilter::kBrowse)
+    {
+        ReloadBrowseDirectory();
+    }
+    UpdateSidebarCounts();
     LoadSideTags();
+}
+
+void Application::UpdateSidebarCounts()
+{
+    sidebarCounts_.fill(0);
+    for (const Resource& item : items_)
+    {
+        ++sidebarCounts_[0];
+        if (item.type == ResourceType::kVideo)
+        {
+            ++sidebarCounts_[1];
+        }
+        else
+        {
+            ++sidebarCounts_[2];
+        }
+        if (item.favorite)
+        {
+            ++sidebarCounts_[3];
+        }
+    }
+    sidebarCounts_[kBrowseNavigationIndex] = browseItems_.size();
 }
 
 void Application::LoadSideTags()
 {
     sideTags_ = tags_.LoadAllWithCounts();
     ClampSideScroll();
+}
+
+void Application::ReloadBrowseDirectory()
+{
+    EndDragSelection(true);
+    if (browsePath_.empty())
+    {
+        browsePath_ = libraryRoot_;
+    }
+    browseItems_.clear();
+    std::error_code rootError;
+    if (!std::filesystem::is_directory(browsePath_, rootError) || rootError)
+    {
+        sidebarCounts_[kBrowseNavigationIndex] = 0;
+        return;
+    }
+
+    struct Entry
+    {
+        std::filesystem::path path;
+        bool directory = false;
+    };
+    std::vector<Entry> entries;
+    std::error_code iterationError;
+    for (std::filesystem::directory_iterator iterator(
+             browsePath_, std::filesystem::directory_options::skip_permission_denied,
+             iterationError),
+         end;
+         iterator != end; iterator.increment(iterationError))
+    {
+        if (iterationError)
+        {
+            iterationError.clear();
+            continue;
+        }
+        const std::filesystem::path path = iterator->path();
+        if (path.filename() == L".incoming")
+        {
+            continue;
+        }
+        std::error_code entryError;
+        if (iterator->is_directory(entryError) && !entryError)
+        {
+            entries.push_back({path, true});
+            continue;
+        }
+        if (entryError || !iterator->is_regular_file(entryError) ||
+            entryError || !service::ImportService::Classify(path).has_value())
+        {
+            continue;
+        }
+        entries.push_back({path, false});
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const Entry& left,
+                                                 const Entry& right) {
+        if (left.directory != right.directory)
+        {
+            return left.directory > right.directory;
+        }
+        return AsciiLower(WideToUtf8(left.path.filename().wstring())) <
+               AsciiLower(WideToUtf8(right.path.filename().wstring()));
+    });
+
+    if (!BrowsePathsEqual(browsePath_, libraryRoot_))
+    {
+        Resource parent;
+        parent.id = BrowseSyntheticId(browsePath_.parent_path());
+        parent.type = ResourceType::kFolder;
+        parent.path = browsePath_.parent_path();
+        parent.originalFilename = "..";
+        parent.title = "返回上一级";
+        browseItems_.push_back(std::move(parent));
+    }
+
+    for (const Entry& entry : entries)
+    {
+        if (entry.directory)
+        {
+            Resource folder;
+            folder.id = BrowseSyntheticId(entry.path);
+            folder.type = ResourceType::kFolder;
+            folder.path = entry.path;
+            folder.originalFilename =
+                WideToUtf8(entry.path.filename().wstring());
+            folder.title = folder.originalFilename;
+            folder.addedTime = static_cast<std::int64_t>(std::time(nullptr));
+            folder.modifiedTime = folder.addedTime;
+            browseItems_.push_back(std::move(folder));
+            continue;
+        }
+
+        Resource media;
+        bool indexed = false;
+        for (const Resource& candidate : items_)
+        {
+            if (BrowsePathsEqual(candidate.path, entry.path))
+            {
+                media = candidate;
+                indexed = true;
+                break;
+            }
+        }
+        if (!indexed)
+        {
+            const std::optional<ResourceType> type =
+                service::ImportService::Classify(entry.path);
+            if (!type.has_value())
+            {
+                continue;
+            }
+            media.id = BrowseSyntheticId(entry.path);
+            media.type = *type;
+            media.path = entry.path;
+            media.originalFilename =
+                WideToUtf8(entry.path.filename().wstring());
+            media.title = WideToUtf8(entry.path.stem().wstring());
+            std::error_code sizeError;
+            media.fileSize = std::filesystem::file_size(entry.path, sizeError);
+            media.addedTime = static_cast<std::int64_t>(std::time(nullptr));
+            media.modifiedTime = media.addedTime;
+        }
+        browseItems_.push_back(std::move(media));
+    }
+    sidebarCounts_[kBrowseNavigationIndex] = browseItems_.size();
+    statusMessage_ = L"浏览：" + browsePath_.wstring();
 }
 
 D2D1_RECT_F Application::SidebarRect() const
@@ -1703,25 +2399,69 @@ void Application::DrawSidebar()
     renderer_.FillRect(panel, render::Theme::kPanel);
     renderer_.FillRect({panel.right, panel.top, panel.right + s, panel.bottom},
                        render::Theme::kBorder);
-    renderer_.DrawTextWide(L"标签", {18.0f * s, panel.top + 18.0f * s,
-                                      panel.right - 18.0f * s,
-                                      panel.top + 44.0f * s},
+    renderer_.DrawTextWide(navigationExpanded_ ? L"资源库  ▾" : L"资源库  ▸",
+                           {18.0f * s, panel.top + 12.0f * s,
+                                         panel.right - 18.0f * s,
+                                         panel.top + 38.0f * s},
                            render::TextRole::kSecondary,
                            render::Theme::kTextSecondary);
     const D2D1_RECT_F settings = SettingsRect();
     const float listBottom = settings.top - 8.0f * s;
-    float y = panel.top + kSideListTopDp * s - sideScrollY_;
-    for (size_t i = 0; i < sideTags_.size(); ++i)
+    const float listTop = panel.top + kSideListTopDp * s;
+    const float navBottom = navigationExpanded_
+        ? listTop + kSidebarNavigationCount * kSideItemHeightDp * s
+        : listTop;
+    const float tagsHeaderTop = navBottom + kSideSectionGapDp * s;
+    const float tagsTop = tagsHeaderTop + 30.0f * s;
+    renderer_.PushRectClip({panel.left, panel.top, panel.right, listBottom});
+    static const wchar_t* const kNavigationLabels[] = {
+        L"全部", L"视频", L"图片", L"收藏", L"浏览"};
+    float y = listTop;
+    for (int i = 0; navigationExpanded_ && i < kSidebarNavigationCount; ++i)
     {
-        if (y + kSideItemHeightDp * s < panel.top || y > listBottom)
+        const D2D1_RECT_F row = {10.0f * s, y, panel.right - 10.0f * s,
+                                 y + kSideItemHeightDp * s - 4.0f * s};
+        const bool active = static_cast<int>(sidebarFilter_) == i &&
+                            tagFilter_.empty();
+        if (active || sideHover_ == i)
+        {
+            renderer_.FillRoundRect(
+                row, active ? render::Theme::kAccent
+                            : render::Theme::kCardHover,
+                8.0f * s);
+        }
+        renderer_.DrawTextWide(
+            kNavigationLabels[i],
+            {22.0f * s, y, panel.right - 58.0f * s,
+             y + kSideItemHeightDp * s},
+            render::TextRole::kSecondary, render::Theme::kText);
+        renderer_.DrawTextUtf8(
+            std::to_string(sidebarCounts_[static_cast<size_t>(i)]),
+            {panel.right - 52.0f * s, y, panel.right - 18.0f * s,
+             y + kSideItemHeightDp * s},
+            render::TextRole::kStatus, render::Theme::kTextSecondary);
+        y += kSideItemHeightDp * s;
+    }
+    renderer_.DrawTextWide(tagsExpanded_ ? L"标签  ▾" : L"标签  ▸",
+                           {18.0f * s, tagsHeaderTop, panel.right - 18.0f * s,
+                            tagsHeaderTop + 26.0f * s},
+                           render::TextRole::kStatus,
+                           render::Theme::kTextSecondary);
+    y = tagsTop - sideScrollY_;
+    for (size_t i = 0; tagsExpanded_ && i < sideTags_.size(); ++i)
+    {
+        if (y + kSideItemHeightDp * s < tagsTop || y > listBottom)
         {
             y += kSideItemHeightDp * s;
             continue;
         }
-        const bool active = tagFilter_ == sideTags_[i].name;
+        const bool active = sidebarFilter_ == SidebarFilter::kAll &&
+                            tagFilter_ == sideTags_[i].name;
+        const int hoverIndex = kSidebarNavigationCount +
+                               static_cast<int>(i);
         const D2D1_RECT_F row = {10.0f * s, y, panel.right - 10.0f * s,
                                  y + kSideItemHeightDp * s - 4.0f * s};
-        if (active || static_cast<int>(i) == sideHover_)
+        if (active || hoverIndex == sideHover_)
         {
             renderer_.FillRoundRect(row, active ? render::Theme::kAccent
                                                 : render::Theme::kCardHover,
@@ -1729,20 +2469,20 @@ void Application::DrawSidebar()
         }
         renderer_.DrawTextUtf8(sideTags_[i].name,
                                {22.0f * s, y, panel.right - 56.0f * s,
-                                y + kSideItemHeightDp * s - 4.0f * s},
+                                y + kSideItemHeightDp * s},
                                render::TextRole::kSecondary,
                                render::Theme::kText);
         renderer_.DrawTextUtf8(std::to_string(sideTags_[i].count),
                                {panel.right - 52.0f * s, y,
                                 panel.right - 18.0f * s,
-                                y + kSideItemHeightDp * s - 4.0f * s},
+                                y + kSideItemHeightDp * s},
                                render::TextRole::kStatus,
                                render::Theme::kTextSecondary);
         y += kSideItemHeightDp * s;
     }
-    renderer_.FillRoundRect(settings, render::Theme::kCard, 10.0f * s);
-    renderer_.StrokeRoundRect(settings, render::Theme::kBorder, 1.0f * s,
-                              10.0f * s);
+    renderer_.PopRectClip();
+    // Settings is an unobtrusive icon-only entry; keep its hit target but do
+    // not paint a button background or outline over the sidebar.
     renderer_.DrawTextWide(L"⚙", settings, render::TextRole::kTitle,
                            render::Theme::kTextSecondary);
 }
@@ -1751,28 +2491,71 @@ void Application::ClampSideScroll()
 {
     const D2D1_RECT_F panel = SidebarRect();
     const D2D1_RECT_F settings = SettingsRect();
-    const float viewport = settings.top - panel.top -
-                           kSideListTopDp * scale_ - 8.0f * scale_;
-    const float total = static_cast<float>(sideTags_.size()) *
-                        kSideItemHeightDp * scale_;
+    const float s = scale_;
+    const float listTop = panel.top + kSideListTopDp * s;
+    const float navBottom = navigationExpanded_
+        ? listTop + kSidebarNavigationCount * kSideItemHeightDp * s
+        : listTop;
+    const float tagsTop = navBottom + (kSideSectionGapDp + 30.0f) * s;
+    const float viewport = std::max(0.0f, settings.top - tagsTop - 8.0f * s);
+    const float total = tagsExpanded_
+        ? static_cast<float>(sideTags_.size()) * kSideItemHeightDp * s
+        : 0.0f;
     sideScrollY_ = std::clamp(sideScrollY_, 0.0f,
                               std::max(0.0f, total - viewport));
 }
 
-int Application::HitTestSideTag(POINT point) const
+int Application::HitTestSidebar(POINT point) const
 {
     const D2D1_RECT_F panel = SidebarRect();
+    const float s = scale_;
+    const float listTop = panel.top + kSideListTopDp * s;
+    const float navBottom = navigationExpanded_
+        ? listTop + kSidebarNavigationCount * kSideItemHeightDp * s
+        : listTop;
+    const float tagsHeaderTop = navBottom + kSideSectionGapDp * s;
+    const float tagsTop = tagsHeaderTop + 30.0f * s;
     if (point.x < static_cast<LONG>(panel.left) ||
-        point.x > static_cast<LONG>(panel.right) ||
-        point.y < static_cast<LONG>(panel.top + kSideListTopDp * scale_) ||
-        point.y >= static_cast<LONG>(SettingsRect().top - 8.0f * scale_))
+        point.x >= static_cast<LONG>(panel.right) ||
+        point.y < static_cast<LONG>(panel.top) ||
+        point.y >= static_cast<LONG>(SettingsRect().top - 8.0f * s))
     {
         return -1;
     }
-    const float y = static_cast<float>(point.y) - panel.top -
-                    kSideListTopDp * scale_ + sideScrollY_;
-    const int index = static_cast<int>(y / (kSideItemHeightDp * scale_));
-    return index >= 0 && index < static_cast<int>(sideTags_.size()) ? index : -1;
+    if (point.y >= static_cast<LONG>(panel.top) &&
+        point.y < static_cast<LONG>(listTop))
+    {
+        return kSidebarNavigationHeader;
+    }
+    if (point.y >= static_cast<LONG>(tagsHeaderTop) &&
+        point.y < static_cast<LONG>(tagsTop))
+    {
+        return kSidebarTagsHeader;
+    }
+    if (!navigationExpanded_ && point.y < static_cast<LONG>(tagsHeaderTop))
+    {
+        return -1;
+    }
+    if (point.y < static_cast<LONG>(navBottom))
+    {
+        const int index = static_cast<int>(
+            (static_cast<float>(point.y) - listTop) /
+            (kSideItemHeightDp * s));
+        return index >= 0 && index < kSidebarNavigationCount ? index : -1;
+    }
+    if (point.y < static_cast<LONG>(tagsTop))
+    {
+        return -1;
+    }
+    if (!tagsExpanded_)
+    {
+        return -1;
+    }
+    const float y = static_cast<float>(point.y) - tagsTop + sideScrollY_;
+    const int index = static_cast<int>(y / (kSideItemHeightDp * s));
+    return index >= 0 && index < static_cast<int>(sideTags_.size())
+        ? kSidebarNavigationCount + index
+        : -1;
 }
 
 void Application::SeedEmptyLibrary()
@@ -1781,64 +2564,110 @@ void Application::SeedEmptyLibrary()
     {
         return;
     }
+    if (seedWorker_.joinable())
+    {
+        return;
+    }
     // First run: generate demo images and run them through the real import
-    // pipeline so the archive/database flow is exercised end to end.
-    const std::filesystem::path sampleDir = SampleAssets::SampleDir();
-    SampleAssets::EnsureSampleImages(sampleDir);
+    // pipeline so the archive/database flow is exercised end to end. The
+    // potentially expensive GDI+ work stays off the UI thread.
+    const bool deleteSource = settings_.deleteSourceAfterImport();
+    seedWorker_ = std::thread([this, deleteSource] {
+        const std::filesystem::path sampleDir = SampleAssets::SampleDir();
+        SampleAssets::EnsureSampleImages(sampleDir);
 
-    std::vector<std::filesystem::path> files;
-    for (int i = 0; i < 18; ++i)
-    {
-        wchar_t fileName[32] = {};
-        swprintf(fileName, 32, L"sample-%02d.png", i);
-        std::filesystem::path path = sampleDir / fileName;
-        if (std::filesystem::exists(path))
+        std::vector<std::filesystem::path> files;
+        for (int i = 0; i < 18; ++i)
         {
-            files.push_back(std::move(path));
+            wchar_t fileName[32] = {};
+            swprintf(fileName, 32, L"sample-%02d.png", i);
+            std::filesystem::path path = sampleDir / fileName;
+            if (std::filesystem::exists(path))
+            {
+                files.push_back(std::move(path));
+            }
         }
-    }
-    if (!files.empty())
-    {
-        importer_.Import(std::move(files));
-    }
+        if (!files.empty())
+        {
+            service::ImportMetadata metadata;
+            metadata.deleteSource = deleteSource;
+            importer_.Import(std::move(files), std::move(metadata));
+        }
+    });
 }
 
 void Application::Refilter()
 {
-    std::wstring query = searchBar_.text();
-    if (!tagFilter_.empty())
+    EndDragSelection(true);
+    if (sidebarFilter_ == SidebarFilter::kBrowse)
     {
+        filtered_.clear();
+        const std::wstring query = searchBar_.text();
+        for (const Resource& item : browseItems_)
+        {
+            if (BrowseTextMatches(item, query))
+            {
+                filtered_.push_back(&item);
+            }
+        }
+        ApplyResourceOrder();
+        if (selectedId_ != 0 && SelectedIndex() < 0)
+        {
+            selectedId_ = 0;
+        }
+        std::unordered_set<ResourceId> visibleSelection;
+        for (const Resource* item : filtered_)
+        {
+            if (selectedIds_.contains(item->id))
+            {
+                visibleSelection.insert(item->id);
+            }
+        }
+        selectedIds_ = std::move(visibleSelection);
+        hoveredId_ = 0;
+        ClampScroll();
+        Invalidate();
+        return;
+    }
+    std::wstring query = searchBar_.text();
+    auto prepend = [&query](const std::wstring& token) {
         if (!query.empty())
         {
             query.insert(0, L" ");
         }
-        query.insert(0, L"tag:" + Utf8ToWide(tagFilter_));
+        query.insert(0, token);
+    };
+    switch (sidebarFilter_)
+    {
+    case SidebarFilter::kVideo:
+        prepend(L"type:video");
+        break;
+    case SidebarFilter::kImage:
+        prepend(L"type:image");
+        break;
+    case SidebarFilter::kFavorite:
+        prepend(L"favorite:true");
+        break;
+    case SidebarFilter::kAll:
+    case SidebarFilter::kBrowse:
+        break;
+    }
+    if (!tagFilter_.empty())
+    {
+        const std::wstring tag = Utf8ToWide(tagFilter_);
+        if (tag.find_first_of(L" \t") != std::wstring::npos)
+        {
+            prepend(L"+tag:\"" + tag + L"\"");
+        }
+        else
+        {
+            prepend(L"+tag:" + tag);
+        }
     }
     filtered_ = service::SearchService::Search(
         resources_, items_, query,
         [this](const std::string& word) { return tags_.ResolveWord(word); });
-    if (sortMode_ != SortMode::kRelevance)
-    {
-        std::sort(filtered_.begin(), filtered_.end(), [this](
-            const Resource* left, const Resource* right) {
-            if (sortMode_ == SortMode::kRecentOpen &&
-                left->lastOpenTime != right->lastOpenTime)
-            {
-                return left->lastOpenTime > right->lastOpenTime;
-            }
-            if (sortMode_ == SortMode::kHot &&
-                left->hotScore != right->hotScore)
-            {
-                return left->hotScore > right->hotScore;
-            }
-            if (sortMode_ == SortMode::kAdded &&
-                left->addedTime != right->addedTime)
-            {
-                return left->addedTime > right->addedTime;
-            }
-            return left->id > right->id;
-        });
-    }
+    ApplyResourceOrder();
 
     if (selectedId_ != 0 && SelectedIndex() < 0)
     {
@@ -1865,6 +2694,130 @@ void Application::ClampScroll()
     const float viewport = view.content.bottom - view.content.top;
     const float maxScroll = std::max(0.0f, total - viewport);
     scrollY_ = std::clamp(scrollY_, 0.0f, maxScroll);
+}
+
+void Application::ApplyResourceOrder(bool reset)
+{
+    const bool browse = sidebarFilter_ == SidebarFilter::kBrowse;
+    ui::ResourceOrder* order = &libraryOrder_;
+    std::wstring* previous_query = &orderQuery_;
+    if (browse)
+    {
+        auto& snapshot = browseOrders_[BrowsePathKey(browsePath_)];
+        order = &snapshot.order;
+        previous_query = &snapshot.query;
+    }
+    const auto& source = browse ? browseItems_ : items_;
+    std::vector<const Resource*> all;
+    all.reserve(source.size());
+    for (const Resource& item : source)
+    {
+        all.push_back(&item);
+    }
+    const std::wstring query = searchBar_.text();
+    if (reset || !order->initialized() ||
+        (sortMode_ == SortMode::kRelevance && *previous_query != query))
+    {
+        std::vector<const Resource*> ranked = all;
+        if (sortMode_ == SortMode::kRelevance && !browse)
+        {
+            // Sidebar filters take a subset of this search-only snapshot.
+            ranked = service::SearchService::Search(
+                resources_, items_, query,
+                [this](const std::string& word)
+                {
+                    return tags_.ResolveWord(word);
+                });
+        }
+        ui::SortResources(&ranked, sortMode_, browse);
+        order->Reset(ranked);
+        *previous_query = query;
+    }
+    order->Reconcile(all);
+    order->Apply(&filtered_);
+    if (browse)
+    {
+        // New folders still belong before media, in alphabetical order.
+        ui::SortResources(&filtered_, SortMode::kRelevance, true);
+    }
+}
+
+void Application::UpdateDragSelection(POINT pointer)
+{
+    if (!selectionDrag_.active())
+    {
+        return;
+    }
+    const auto content = ContentRect();
+    selectionDrag_.Update(pointer, content, scrollY_);
+    selectedIds_ = selectionDrag_.Select(ui::ResourceGrid::HitTestRect(
+        MakeView(content), selectionDrag_.content_rect()));
+    selectedId_ = 0;
+    for (const Resource* item : filtered_)
+    {
+        if (selectedIds_.contains(item->id))
+        {
+            selectedId_ = item->id;
+            break;
+        }
+    }
+    UpdateSelectionTimer();
+    Invalidate();
+}
+
+void Application::EndDragSelection(bool cancel)
+{
+    if (selectionTimerRunning_)
+    {
+        KillTimer(hwnd_, kSelectionTimer);
+        selectionTimerRunning_ = false;
+    }
+    if (!selectionDrag_.active())
+    {
+        return;
+    }
+    if (cancel)
+    {
+        selectedIds_.clear();
+        for (const Resource* item : filtered_)
+        {
+            if (selectionDrag_.original().contains(item->id))
+            {
+                selectedIds_.insert(item->id);
+            }
+        }
+        selectedId_ = selectedIds_.contains(selectionDrag_.original_primary())
+            ? selectionDrag_.original_primary()
+            : selectedIds_.empty() ? 0 : *selectedIds_.begin();
+    }
+    // End before ReleaseCapture: WM_CAPTURECHANGED must not undo a commit.
+    selectionDrag_.End();
+    if (GetCapture() == hwnd_)
+    {
+        ReleaseCapture();
+    }
+    Invalidate();
+}
+
+void Application::UpdateSelectionTimer()
+{
+    const float step = selectionDrag_.ScrollStep(ContentRect(), scale_);
+    const auto content = ContentRect();
+    const float maximum = std::max(0.0f,
+        ui::ResourceGrid::ContentHeight(MakeView(content)) -
+            (content.bottom - content.top));
+    const bool needed = selectionDrag_.active() &&
+        ((step < 0.0f && scrollY_ > 0.0f) ||
+         (step > 0.0f && scrollY_ < maximum));
+    if (needed && !selectionTimerRunning_)
+    {
+        selectionTimerRunning_ = SetTimer(hwnd_, kSelectionTimer, 30, nullptr) != 0;
+    }
+    else if (!needed && selectionTimerRunning_)
+    {
+        KillTimer(hwnd_, kSelectionTimer);
+        selectionTimerRunning_ = false;
+    }
 }
 
 int Application::SelectedIndex() const
@@ -1925,13 +2878,19 @@ void Application::OpenResource(Resource* item)
     {
         return;
     }
+    if (item->type == ResourceType::kFolder)
+    {
+        ShellExecuteW(hwnd_, L"open", item->path.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
+        return;
+    }
     std::error_code existenceError;
     if (!std::filesystem::exists(item->path, existenceError) ||
         existenceError)
     {
         item->missing = true;
         resources_.SetMissing(item->id, true);
-        MessageBoxW(hwnd_, L"文件缺失，无法打开。", L"Nexus", MB_ICONWARNING);
+        MessageBoxW(hwnd_, L"文件缺失，无法打开。", L"Viewer", MB_ICONWARNING);
         Invalidate();
         return;
     }
@@ -1946,7 +2905,7 @@ void Application::OpenResource(Resource* item)
     }
     if (!opened)
     {
-        MessageBoxW(hwnd_, L"无法启动关联的打开程序。", L"Nexus",
+        MessageBoxW(hwnd_, L"无法启动关联的打开程序。", L"Viewer",
                     MB_ICONWARNING);
         return;
     }
@@ -1961,6 +2920,9 @@ void Application::OpenResource(Resource* item)
         item->lastOpenTime = lastOpenTime;
         item->totalOpenCount = totalOpenCount;
         item->hotScore = hotScore;
+        UpdateSidebarCounts();
+        // Keep the current snapshot and viewport stable until an explicit sort.
+        Invalidate();
     }
 }
 
@@ -2000,9 +2962,7 @@ void Application::DeleteSelected(bool permanent)
     {
         message << L"\n\n此操作不可恢复。";
     }
-    if (MessageBoxW(hwnd_, message.str().c_str(),
-                    permanent ? L"永久删除" : L"删除资源",
-                    MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+    if (!ui::DeleteDialog::Show(hwnd_, message.str(), permanent))
     {
         return;
     }
@@ -2045,6 +3005,7 @@ void Application::ToggleSelectedFavorite()
     {
         item->favorite = favorite;
     }
+    UpdateSidebarCounts();
     Refilter();
 }
 
@@ -2092,7 +3053,7 @@ void Application::EditSelectedMetadata()
         files.push_back(resource->path);
     }
     auto edited = ui::ImportDialog::Show(
-        hwnd_, files, categoryNames, tags_.RecentTags(10),
+        hwnd_, files, categoryNames, BuildQuickTags(settings_, tags_),
         single ? &initial : nullptr, true);
     if (!edited.has_value())
     {
@@ -2131,7 +3092,7 @@ void Application::EditSelectedMetadata()
     if (!ok || !database_.Exec("COMMIT;"))
     {
         database_.Exec("ROLLBACK;");
-        MessageBoxW(hwnd_, L"Metadata 保存失败，原数据保持不变。", L"Nexus",
+        MessageBoxW(hwnd_, L"Metadata 保存失败，原数据保持不变。", L"Viewer",
                     MB_ICONERROR);
         return;
     }
@@ -2152,6 +3113,35 @@ void Application::MissingWorkerLoop()
         return;
     }
     repo::ResourceRepository resources(database);
+
+    // Older databases may contain video rows created before FFmpeg probing
+    // was enabled.  Repair those durations once in the background so the
+    // thumbnail badge appears without requiring a re-import or a manual scan.
+    bool durationChanged = false;
+    for (const Resource& resource : resources.LoadAll())
+    {
+        if (stopMissingWorker_ || resource.type != ResourceType::kVideo ||
+            resource.duration > 0 || resource.missing)
+        {
+            continue;
+        }
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(resource.path, error) || error)
+        {
+            continue;
+        }
+        const std::int64_t duration =
+            service::DetectMediaDuration(resource.path);
+        if (duration > 0 && resources.UpdateDuration(resource.id, duration))
+        {
+            durationChanged = true;
+        }
+    }
+    if (durationChanged && IsWindow(hwnd_))
+    {
+        PostMessageW(hwnd_, kMissingUpdatedMsg, 0, 0);
+    }
+
     while (!stopMissingWorker_)
     {
         if (resources.RefreshMissing())
@@ -2173,19 +3163,209 @@ void Application::ChooseSortMode()
     ClientToScreen(hwnd_, &anchor);
     const int selected = SortPopup::Show(hwnd_, anchor, scale_,
                                          static_cast<int>(sortMode_));
-    if (selected < 0 || selected == static_cast<int>(sortMode_))
+    if (selected < 0)
     {
         return;
     }
     sortMode_ = static_cast<SortMode>(selected);
+    libraryOrder_ = ui::ResourceOrder();
+    browseOrders_.clear();
+    ApplyResourceOrder(true);
     Refilter();
+}
+
+void Application::StartBackgroundBuild()
+{
+    // A previous directory pass may have finished but still own a joinable
+    // thread.  Stop it before starting a new pass so two workers never race
+    // to enrich the same rows or warm the same thumbnail queue.
+    stopLibraryScanWorker_ = true;
+    if (libraryScanWorker_.joinable())
+    {
+        libraryScanWorker_.join();
+    }
+    stopLibraryScanWorker_ = false;
+
+    const std::filesystem::path scanRoot = libraryRoot_;
+    const std::filesystem::path scanDatabase = exeDir_ / L"data" / L"nexus.db";
+    statusMessage_ = L"正在后台构建缓存…";
+    libraryScanWorker_ = std::thread([this, scanRoot, scanDatabase] {
+        const HWND notifyWindow = hwnd_;
+        const UINT readyMessage = kLibraryScanReadyMsg;
+        const auto stopped = [this] {
+            return stopLibraryScanWorker_.load();
+        };
+        const auto notifyReady = [notifyWindow, readyMessage, stopped] {
+            if (!stopped() && IsWindow(notifyWindow))
+            {
+                PostMessageW(notifyWindow, readyMessage, 0, 0);
+            }
+        };
+
+        // Discover newly copied files cheaply first.  Each inserted row is
+        // immediately visible after the ready notification; expensive probes
+        // are deferred to RunIncremental below.
+        service::ScanService::RunLightweight(
+            scanDatabase, scanRoot,
+            [notifyReady] { notifyReady(); }, stopped);
+        if (stopped())
+        {
+            return;
+        }
+        notifyReady();
+
+        service::ScanService::RunIncremental(
+            scanDatabase, scanRoot, 24,
+            [notifyReady](const service::ScanResult&) { notifyReady(); },
+            stopped);
+        if (stopped())
+        {
+            return;
+        }
+
+        // Warm the disk thumbnail cache in small pages.  Request() is
+        // thread-safe and only enqueues work; the dedicated thumbnail
+        // workers perform WIC/Shell decoding without blocking this pass.
+        db::Database cacheDatabase;
+        if (cacheDatabase.Open(scanDatabase) && db::Migrate(cacheDatabase))
+        {
+            repo::ResourceRepository cacheResources(cacheDatabase);
+            ResourceId afterId = 0;
+            while (!stopped())
+            {
+                const std::vector<Resource> batch =
+                    cacheResources.LoadMediaBatch(32, afterId);
+                if (batch.empty())
+                {
+                    break;
+                }
+                for (const Resource& resource : batch)
+                {
+                    afterId = std::max(afterId, resource.id);
+                    if (!stopped())
+                    {
+                        thumbnails_.Request(resource);
+                    }
+                }
+                // Keep the queue from monopolising disk bandwidth while the
+                // user is already browsing the first page.
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        if (!stopped() && IsWindow(notifyWindow))
+        {
+            PostMessageW(notifyWindow, kLibraryScanDoneMsg, 0, 0);
+        }
+    });
+}
+
+void Application::ClearCacheAndRebuild()
+{
+    EndDragSelection(true);
+    libraryOrder_ = ui::ResourceOrder();
+    browseOrders_.clear();
+    // Quiesce workers before changing the shared database and cache
+    // directories. Shutdown drains queued imports/deletes, so no source file
+    // is removed by this action and no worker can recreate a thumbnail after
+    // the directory has been cleared.
+    stopLibraryScanWorker_ = true;
+    if (libraryScanWorker_.joinable())
+    {
+        libraryScanWorker_.join();
+    }
+    // MissingWorkerLoop owns a separate SQLite connection and may still be
+    // probing durations or refreshing missing flags.  Stop and join it
+    // before clearing the shared index; assigning a new std::thread while the
+    // old one is joinable would terminate the process in the CRT, and the
+    // worker could otherwise race the DELETE statements below.
+    stopMissingWorker_ = true;
+    if (missingWorker_.joinable())
+    {
+        missingWorker_.join();
+    }
+    importer_.Shutdown();
+    deleter_.Shutdown();
+    thumbnails_.Shutdown();
+
+    bool cleared = database_.Exec("BEGIN;") &&
+        database_.Exec("DELETE FROM resource_fts;") &&
+        database_.Exec("DELETE FROM resources;") &&
+        database_.Exec("DELETE FROM resource_tags;") &&
+        database_.Exec("DELETE FROM tag_alias;") &&
+        database_.Exec("DELETE FROM tags;") &&
+        database_.Exec("DELETE FROM resource_actors;") &&
+        database_.Exec("DELETE FROM actors;") &&
+        database_.Exec("DELETE FROM categories;") &&
+        database_.Exec("DELETE FROM open_history;") &&
+        database_.Exec("DELETE FROM operation_log;") &&
+        database_.Exec("DELETE FROM sqlite_sequence WHERE name='resources';") &&
+        database_.Exec("COMMIT;");
+    if (!cleared)
+    {
+        database_.Exec("ROLLBACK;");
+    }
+
+    thumbnails_.ClearCache();
+    const std::filesystem::path databasePath =
+        exeDir_ / L"data" / L"nexus.db";
+    importer_.Start(hwnd_, kImportDoneMsg, kImportProgressMsg);
+    deleter_.Start(hwnd_, kDeleteDoneMsg);
+    thumbnails_.Start(hwnd_, kThumbReadyMsg,
+                      exeDir_ / L"cache" / L"thumbnails");
+    stopMissingWorker_ = false;
+    // The previous worker was joined above, so this assignment is always to
+    // a non-joinable thread object.
+    missingWorker_ = std::thread([this] { MissingWorkerLoop(); });
+    selectedId_ = 0;
+    selectedIds_.clear();
+    browseItems_.clear();
+    ReloadFromDatabase();
+    Refilter();
+    if (!cleared)
+    {
+        statusMessage_ = L"清空缓存失败，未开始重建";
+        MessageBoxW(hwnd_, L"清空 SQLite 数据失败，原文件未受影响。",
+                    L"Viewer", MB_ICONERROR);
+        Invalidate();
+        return;
+    }
+    statusMessage_ = L"缓存已清空，正在重建索引…";
+    StartBackgroundBuild();
+    (void)databasePath;
 }
 
 void Application::ShowSettings()
 {
-    if (ui::SettingsDialog::Show(hwnd_, &settings_))
+    bool clearCacheRequested = false;
+    if (ui::SettingsDialog::Show(hwnd_, &settings_, &clearCacheRequested))
     {
-        settings_.Save(exeDir_ / L"nexus.toml");
+        libraryRoot_ = settings_.managedLibrary().empty()
+            ? exeDir_ / L"NexusLibrary"
+            : std::filesystem::path(settings_.managedLibrary());
+        browsePath_ = libraryRoot_;
+        archive_.SetLibraryRoot(libraryRoot_);
+        if (settings_.Save(exeDir_ / L"nexus.toml"))
+        {
+            if (clearCacheRequested)
+            {
+                ClearCacheAndRebuild();
+            }
+            else
+            {
+                // Re-index the selected managed folder in the same segmented
+                // startup pipeline. Existing metadata is preserved and files
+                // not yet present in SQLite become visible after the
+                // lightweight page commits.
+                StartBackgroundBuild();
+            }
+        }
+        else
+        {
+            statusMessage_ = L"设置保存失败";
+            MessageBoxW(hwnd_, L"设置保存失败，本次运行仍使用新设置。",
+                        L"Viewer", MB_ICONWARNING);
+        }
+        Invalidate();
     }
 }
 
@@ -2206,6 +3386,62 @@ D2D1_RECT_F Application::ContentRect() const
     const float top = (kCaptionBarDp + kTopBarDp + 1.0f) * s;
     const float bottom = height - (kStatusBarDp + 1.0f) * s;
     return {kSidebarWidthDp * scale_, top, width, std::max(top, bottom)};
+}
+
+std::optional<D2D1_RECT_F> Application::CardScrollThumbRect() const
+{
+    if (filtered_.empty())
+    {
+        return std::nullopt;
+    }
+    const D2D1_RECT_F content = ContentRect();
+    const ui::GridView view = MakeView(content);
+    const float total = ui::ResourceGrid::ContentHeight(view);
+    const float viewport = content.bottom - content.top;
+    if (total <= viewport || viewport <= 0.0f)
+    {
+        return std::nullopt;
+    }
+
+    const float thumbHeight = std::min(
+        viewport, std::max(30.0f * scale_, viewport * viewport / total));
+    const float maxScroll = total - viewport;
+    const float travel = std::max(0.0f, viewport - thumbHeight);
+    const float fraction = maxScroll > 0.0f
+        ? std::clamp(scrollY_ / maxScroll, 0.0f, 1.0f)
+        : 0.0f;
+    const float y = content.top + travel * fraction;
+    return D2D1_RECT_F{content.right - 5.0f * scale_, y,
+                       content.right - 2.0f * scale_, y + thumbHeight};
+}
+
+void Application::UpdateCardScrollFromPointer(float pointerY)
+{
+    const auto thumb = CardScrollThumbRect();
+    if (!thumb.has_value())
+    {
+        return;
+    }
+    const D2D1_RECT_F content = ContentRect();
+    const float viewport = content.bottom - content.top;
+    const float thumbHeight = thumb->bottom - thumb->top;
+    const float travel = std::max(0.0f, viewport - thumbHeight);
+    const ui::GridView view = MakeView(content);
+    const float total = ui::ResourceGrid::ContentHeight(view);
+    const float maxScroll = std::max(0.0f, total - viewport);
+    if (travel <= 0.0f || maxScroll <= 0.0f)
+    {
+        scrollY_ = 0.0f;
+    }
+    else
+    {
+        const float top = std::clamp(
+            pointerY - cardScrollDragOffset_, content.top,
+            content.bottom - thumbHeight);
+        scrollY_ = ((top - content.top) / travel) * maxScroll;
+        ClampScroll();
+    }
+    Invalidate();
 }
 
 D2D1_RECT_F Application::SearchRect() const
@@ -2350,6 +3586,10 @@ ui::GridView Application::MakeView(D2D1_RECT_F content) const
     view.content = content;
     view.scrollY = scrollY_;
     view.scale = scale_;
+    if (selectionDrag_.active())
+    {
+        view.selectionRect = selectionDrag_.window_rect(content, scrollY_);
+    }
     return view;
 }
 

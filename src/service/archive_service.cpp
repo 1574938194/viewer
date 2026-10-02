@@ -65,6 +65,32 @@ std::wstring Lower(std::wstring text)
     return text;
 }
 
+std::filesystem::path ManagedPathForRoot(
+    const std::filesystem::path& root, ResourceId id, ResourceType type,
+    const std::wstring& extension)
+{
+    const wchar_t* folder = type == ResourceType::kVideo ? L"video" : L"image";
+    const unsigned bucket = static_cast<unsigned>((id / 100) % 100);
+    wchar_t bucketName[8] = {};
+    swprintf(bucketName, 8, L"%02u", bucket);
+
+    wchar_t fileName[24] = {};
+    swprintf(fileName, 24, L"%012llu",
+             static_cast<unsigned long long>(id));
+    return root / folder / bucketName / (fileName + extension);
+}
+
+std::filesystem::path ManagedPathForFilename(
+    const std::filesystem::path& root, ResourceId id, ResourceType type,
+    const std::filesystem::path& filename)
+{
+    const wchar_t* folder = type == ResourceType::kVideo ? L"video" : L"image";
+    const unsigned bucket = static_cast<unsigned>((id / 100) % 100);
+    wchar_t bucketName[8] = {};
+    swprintf(bucketName, 8, L"%02u", bucket);
+    return root / folder / bucketName / filename.filename();
+}
+
 }  // namespace
 
 ArchiveService::ArchiveService(std::filesystem::path libraryRoot)
@@ -78,30 +104,25 @@ bool ArchiveService::SameVolume(const std::filesystem::path& a,
     return Lower(a.root_name().wstring()) == Lower(b.root_name().wstring());
 }
 
-bool ArchiveService::EnsureDirectories(ResourceType type)
+bool ArchiveService::EnsureDirectories(
+    ResourceType type, const std::filesystem::path& libraryRoot)
 {
     const wchar_t* folder = type == ResourceType::kVideo ? L"video" : L"image";
     std::error_code ec;
-    std::filesystem::create_directories(libraryRoot_ / folder, ec);
-    std::filesystem::create_directories(libraryRoot_ / L".incoming", ec);
+    std::filesystem::create_directories(libraryRoot / folder, ec);
+    if (ec)
+    {
+        return false;
+    }
+    ec.clear();
+    std::filesystem::create_directories(libraryRoot / L".incoming", ec);
     return !ec;
 }
 
 std::filesystem::path ArchiveService::ManagedPath(
     ResourceId id, ResourceType type, const std::wstring& extension) const
 {
-    const wchar_t* folder = type == ResourceType::kVideo ? L"video" : L"image";
-
-    // Bucket by (id / 100) % 100 so directories stay small: 00/..99.
-    const unsigned bucket = static_cast<unsigned>((id / 100) % 100);
-    wchar_t bucketName[8] = {};
-    swprintf(bucketName, 8, L"%02u", bucket);
-
-    wchar_t fileName[24] = {};
-    swprintf(fileName, 24, L"%012llu",
-             static_cast<unsigned long long>(id));
-
-    return libraryRoot_ / folder / bucketName / (fileName + extension);
+    return ManagedPathForRoot(LibraryRootSnapshot(), id, type, extension);
 }
 
 ArchiveResult ArchiveService::Archive(const std::filesystem::path& source,
@@ -110,14 +131,23 @@ ArchiveResult ArchiveService::Archive(const std::filesystem::path& source,
                                       ProgressCallback progress)
 {
     ArchiveResult result;
-    if (!EnsureDirectories(type))
+    const std::filesystem::path libraryRoot = LibraryRootSnapshot();
+    if (source.empty() || libraryRoot.empty())
     {
-        result.error = L"无法创建库目录：" + libraryRoot_.wstring();
+        result.error = L"归档路径为空。";
+        return result;
+    }
+    if (!EnsureDirectories(type, libraryRoot))
+    {
+        result.error = L"无法创建库目录：" + libraryRoot.wstring();
         return result;
     }
 
-    const std::filesystem::path target =
-        ManagedPath(id, type, source.extension().wstring());
+    // Keep the user's original filename in managed storage.  The type and
+    // deterministic id bucket still provide organization without rewriting
+    // names into opaque numeric identifiers.
+    const std::filesystem::path target = ManagedPathForFilename(
+        libraryRoot, id, type, source.filename());
     std::error_code ec;
     if (std::filesystem::exists(target, ec) || ec)
     {
@@ -145,6 +175,16 @@ ArchiveResult ArchiveService::Archive(const std::filesystem::path& source,
                 result.error = L"归档失败：" + source.wstring() + L"（" +
                                std::to_wstring(ec.value()) + L"）";
                 std::filesystem::remove(target, ec);
+                return result;
+            }
+            const auto sourceSize = std::filesystem::file_size(source, ec);
+            const bool sourceSizeOk = !ec;
+            const auto copiedSize = std::filesystem::file_size(target, ec);
+            if (ec || !sourceSizeOk || sourceSize != copiedSize)
+            {
+                std::filesystem::remove(target, ec);
+                result.error = L"归档失败（复制校验大小不一致）：" +
+                               source.wstring();
                 return result;
             }
             if (!deleteSource ||
@@ -232,6 +272,16 @@ bool ArchiveService::Rollback(const std::filesystem::path& source,
     }
     if (!std::filesystem::exists(source, ec))
     {
+        const std::filesystem::path parent = source.parent_path();
+        if (!parent.empty())
+        {
+            std::filesystem::create_directories(parent, ec);
+            if (ec)
+            {
+                return false;
+            }
+        }
+        ec.clear();
         std::filesystem::rename(archive.finalPath, source, ec);
         return !ec;
     }

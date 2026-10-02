@@ -86,8 +86,20 @@ Database::~Database()
 
 bool Database::Open(const std::filesystem::path& file)
 {
+    if (file.empty())
+    {
+        return false;
+    }
     std::error_code ec;
-    std::filesystem::create_directories(file.parent_path(), ec);
+    const std::filesystem::path parent = file.parent_path();
+    if (!parent.empty())
+    {
+        std::filesystem::create_directories(parent, ec);
+        if (ec)
+        {
+            return false;
+        }
+    }
 
     if (sqlite3_open16(file.c_str(), &db_) != SQLITE_OK)
     {
@@ -108,6 +120,7 @@ bool Database::Open(const std::filesystem::path& file)
     {
         if (!Exec(pragma))
         {
+            Close();
             return false;
         }
     }

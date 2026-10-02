@@ -17,12 +17,54 @@ std::string PathKey(const std::filesystem::path& path)
     return WideToUtf8(path.wstring());
 }
 
+// Keep the scalar projection used by LoadAll and the bounded background
+// loaders identical.  ReadResource relies on these column positions.
+constexpr const char* kResourceColumns =
+    "r.id, r.resource_type, r.path,"
+    " r.original_filename, r.title, r.code,"
+    " r.category_id, r.file_size, r.width, r.height,"
+    " r.duration, r.content_hash, r.added_time,"
+    " r.modified_time, r.last_open_time, r.total_open_count, r.hot_score,"
+    " r.favorite, r.thumbnail_key, r.missing, c.name";
+
+Resource ReadResource(db::Statement& statement);
+
+std::vector<Resource> LoadResourceBatch(db::Database& database,
+                                        const char* condition,
+                                        std::size_t limit,
+                                        ResourceId afterId)
+{
+    std::vector<Resource> items;
+    if (limit == 0 || condition == nullptr)
+    {
+        return items;
+    }
+    const std::string sql =
+        std::string("SELECT ") + kResourceColumns +
+        " FROM resources r LEFT JOIN categories c ON c.id=r.category_id " +
+        condition + " ORDER BY r.id ASC LIMIT ?;";
+    db::Statement statement;
+    if (!statement.Prepare(database.handle(), sql.c_str()))
+    {
+        return items;
+    }
+    statement.BindInt(1, static_cast<std::int64_t>(afterId));
+    statement.BindInt(2, static_cast<std::int64_t>(limit));
+    while (statement.StepRow())
+    {
+        items.push_back(ReadResource(statement));
+    }
+    return items;
+}
+
 Resource ReadResource(db::Statement& statement)
 {
     Resource resource;
     resource.id = static_cast<ResourceId>(statement.ColumnInt(0));
-    resource.type = statement.ColumnInt(1) == 0 ? ResourceType::kVideo
-                                                : ResourceType::kImage;
+    const int type = statement.ColumnInt(1);
+    resource.type = type == 0 ? ResourceType::kVideo
+                              : type == 1 ? ResourceType::kImage
+                                          : ResourceType::kFolder;
     resource.path = std::filesystem::path(
         Utf8ToWide(statement.ColumnText(2)));
     resource.originalFilename = statement.ColumnText(3);
@@ -125,6 +167,32 @@ std::vector<Resource> ResourceRepository::LoadAll()
     return items;
 }
 
+std::vector<Resource> ResourceRepository::LoadMediaBatch(std::size_t limit,
+                                                         ResourceId afterId)
+{
+    return LoadResourceBatch(
+        database_,
+        " WHERE r.resource_type IN (0,1) AND r.id > ?",
+        limit, afterId);
+}
+
+std::vector<Resource> ResourceRepository::LoadUnfilledBatch(
+    std::size_t limit, ResourceId afterId)
+{
+    // A missing file is deliberately left for RefreshMissing()/the periodic
+    // missing-file worker.  Once it reappears, the next startup pass will
+    // pick it up again because the derived fields are still empty.
+    return LoadResourceBatch(
+        database_,
+        " WHERE r.resource_type IN (0,1) AND r.id > ?"
+        " AND COALESCE(r.missing,0)=0"
+        " AND (COALESCE(r.content_hash,'')=''"
+        " OR (r.resource_type=1 AND (COALESCE(r.width,0)<=0 OR"
+        " COALESCE(r.height,0)<=0))"
+        " OR (r.resource_type=0 AND COALESCE(r.duration,0)<=0))",
+        limit, afterId);
+}
+
 bool ResourceRepository::Insert(Resource& resource)
 {
     db::Statement statement;
@@ -137,7 +205,9 @@ bool ResourceRepository::Insert(Resource& resource)
     {
         return false;
     }
-    statement.BindInt(0 + 1, resource.type == ResourceType::kVideo ? 0 : 1);
+    statement.BindInt(0 + 1, resource.type == ResourceType::kVideo
+                                ? 0
+                                : resource.type == ResourceType::kImage ? 1 : 2);
     statement.BindText(1 + 1, PathKey(resource.path));
     statement.BindText(2 + 1, resource.originalFilename);
     statement.BindText(3 + 1, resource.title);
@@ -315,7 +385,7 @@ ResourceRepository::FindIndexedFile(const std::filesystem::path& path)
     db::Statement statement;
     if (!statement.Prepare(
             database_.handle(),
-            "SELECT id, file_size, modified_time, content_hash FROM "
+            "SELECT id, file_size, modified_time, content_hash, duration FROM "
             "resources WHERE path = ? COLLATE NOCASE LIMIT 1;"))
     {
         return std::nullopt;
@@ -328,7 +398,7 @@ ResourceRepository::FindIndexedFile(const std::filesystem::path& path)
     return IndexedFileState{
         static_cast<ResourceId>(statement.ColumnInt(0)),
         static_cast<std::uint64_t>(statement.ColumnInt(1)),
-        statement.ColumnInt(2), statement.ColumnText(3)};
+        statement.ColumnInt(2), statement.ColumnText(3), statement.ColumnInt(4)};
 }
 
 bool ResourceRepository::UpdateIndexedFile(
@@ -347,6 +417,19 @@ bool ResourceRepository::UpdateIndexedFile(
     statement.BindInt(2, modifiedTime);
     statement.BindText(3, contentHash);
     statement.BindInt(4, static_cast<std::int64_t>(id));
+    return statement.StepDone();
+}
+
+bool ResourceRepository::UpdateDuration(ResourceId id, std::int64_t duration)
+{
+    db::Statement statement;
+    if (!statement.Prepare(database_.handle(),
+                           "UPDATE resources SET duration=? WHERE id=?;"))
+    {
+        return false;
+    }
+    statement.BindInt(1, duration);
+    statement.BindInt(2, static_cast<std::int64_t>(id));
     return statement.StepDone();
 }
 
@@ -426,18 +509,27 @@ bool ResourceRepository::NoteOpen(ResourceId id)
 {
     const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
 
+    if (!database_.Exec("BEGIN;"))
+    {
+        return false;
+    }
+    auto rollback = [this]() {
+        database_.Exec("ROLLBACK;");
+        return false;
+    };
+
     db::Statement insert;
     if (!insert.Prepare(database_.handle(),
                         "INSERT INTO open_history(resource_id, open_time)"
                         " VALUES(?, ?);"))
     {
-        return false;
+        return rollback();
     }
     insert.BindInt(1, static_cast<std::int64_t>(id));
     insert.BindInt(2, now);
     if (!insert.StepDone())
     {
-        return false;
+        return rollback();
     }
 
     db::Statement counts;
@@ -449,7 +541,7 @@ bool ResourceRepository::NoteOpen(ResourceId id)
                         " COUNT(*)"
                         " FROM open_history WHERE resource_id = ?;"))
     {
-        return false;
+        return rollback();
     }
     counts.BindInt(1, now - 86400);
     counts.BindInt(2, now - 7 * 86400);
@@ -457,7 +549,7 @@ bool ResourceRepository::NoteOpen(ResourceId id)
     counts.BindInt(4, static_cast<std::int64_t>(id));
     if (!counts.StepRow())
     {
-        return false;
+        return rollback();
     }
     const double opens1d = static_cast<double>(counts.ColumnInt(0));
     const double opens7d = static_cast<double>(counts.ColumnInt(1));
@@ -474,13 +566,17 @@ bool ResourceRepository::NoteOpen(ResourceId id)
                         "UPDATE resources SET last_open_time = ?,"
                         " total_open_count = ?, hot_score = ? WHERE id = ?;"))
     {
-        return false;
+        return rollback();
     }
     update.BindInt(1, now);
     update.BindInt(2, static_cast<std::int64_t>(total));
     update.BindDouble(3, hotScore);
     update.BindInt(4, static_cast<std::int64_t>(id));
-    return update.StepDone();
+    if (!update.StepDone() || !database_.Exec("COMMIT;"))
+    {
+        return rollback();
+    }
+    return true;
 }
 
 bool ResourceRepository::LoadOpenStats(

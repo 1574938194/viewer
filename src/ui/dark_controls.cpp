@@ -3,6 +3,8 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 
+#include <algorithm>
+
 namespace nexus::ui::dark {
 namespace {
 
@@ -14,6 +16,17 @@ constexpr wchar_t kSecondaryProp[] = L"NexusSecondary";
 constexpr wchar_t kAccentProp[] = L"NexusAccent";
 constexpr wchar_t kToggleProp[] = L"NexusToggle";
 constexpr wchar_t kComboOrigProcProp[] = L"NexusComboOrigProc";
+constexpr wchar_t kListOrigProcProp[] = L"NexusListOrigProc";
+constexpr wchar_t kListDraggingProp[] = L"NexusListDragging";
+constexpr wchar_t kListDragOffsetProp[] = L"NexusListDragOffset";
+constexpr wchar_t kListHidingScrollProp[] = L"NexusListHidingScroll";
+
+// The list-box scrollbar is drawn inside the client area after the native
+// scrollbar has been disabled. Keeping a fixed strip makes the dark bar
+// visible even when the list currently has fewer rows than fit on screen.
+constexpr int kListScrollBarWidth = 24;
+constexpr int kListScrollTrackWidth = 12;
+constexpr int kListScrollMinThumb = 22;
 
 HFONT g_font = nullptr;
 HFONT g_headerFont = nullptr;
@@ -130,9 +143,6 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wp,
                          checked ? nullptr : reinterpret_cast<HANDLE>(TRUE));
                 InvalidateRect(hwnd, nullptr, TRUE);
             }
-            SendMessageW(GetParent(hwnd), WM_COMMAND,
-                         MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED),
-                         reinterpret_cast<LPARAM>(hwnd));
         }
         break;
     }
@@ -192,6 +202,314 @@ LRESULT CALLBACK ComboSubclassProc(HWND hwnd, UINT message, WPARAM wp,
     return original != nullptr
                ? CallWindowProcW(original, hwnd, message, wp, lp)
                : DefWindowProcW(hwnd, message, wp, lp);
+}
+
+struct ListScrollMetrics
+{
+    RECT bar = {};
+    RECT track = {};
+    RECT thumb = {};
+    int contentRange = 1;
+    int page = 1;
+    int position = 0;
+};
+
+ListScrollMetrics GetListScrollMetrics(HWND hwnd)
+{
+    if (hwnd == nullptr)
+    {
+        return {};
+    }
+
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    const int width = std::max(
+        0, static_cast<int>(client.right - client.left));
+    const int height = std::max(
+        0, static_cast<int>(client.bottom - client.top));
+    if (width <= 0 || height <= 0)
+    {
+        return {};
+    }
+
+    ListScrollMetrics metrics;
+    metrics.bar = {std::max(0, width - kListScrollBarWidth), 0, width,
+                   height};
+    const int trackTop = std::min(4, height);
+    const int trackBottom = std::max(trackTop + 1, height - 4);
+    const int barLeft = static_cast<int>(metrics.bar.left);
+    const int barRight = static_cast<int>(metrics.bar.right);
+    metrics.track = {
+        std::max(barLeft + 2, barRight - kListScrollTrackWidth - 5),
+        trackTop,
+        std::min(barRight - 3, std::max(barLeft + 3, barRight - 5)),
+        trackBottom};
+
+    // Native SCROLLINFO can be stale when its scrollbar is disabled. The
+    // custom bar always follows the actual list content and top item.
+    const int count = std::max(
+        0, static_cast<int>(SendMessageW(hwnd, LB_GETCOUNT, 0, 0)));
+    const int itemHeight = std::max(
+        1, static_cast<int>(SendMessageW(hwnd, LB_GETITEMHEIGHT, 0, 0)));
+    metrics.contentRange = std::max(1, count);
+    metrics.page = std::max(1, height / itemHeight);
+    const int maxPosition =
+        std::max(0, metrics.contentRange - metrics.page);
+    metrics.position = std::clamp(
+        static_cast<int>(SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0)), 0,
+        maxPosition);
+
+    const int trackHeight = std::max(
+        1, static_cast<int>(metrics.track.bottom - metrics.track.top));
+    const int minThumb = std::min(kListScrollMinThumb, trackHeight);
+    const int thumbHeight = metrics.contentRange <= metrics.page
+        ? trackHeight
+        : std::clamp(trackHeight * metrics.page /
+                         std::max(1, metrics.contentRange),
+                     minThumb, trackHeight);
+    const int travel = std::max(0, trackHeight - thumbHeight);
+    const int positionRange =
+        std::max(1, metrics.contentRange - metrics.page);
+    const int thumbTop = metrics.track.top +
+        travel * metrics.position / positionRange;
+    metrics.thumb = {metrics.track.left, thumbTop, metrics.track.right,
+                     thumbTop + thumbHeight};
+    return metrics;
+}
+
+void HideListBoxNativeScrollBar(HWND hwnd)
+{
+    if (hwnd != nullptr &&
+        GetPropW(hwnd, kListHidingScrollProp) == nullptr)
+    {
+        // A list created with WS_VSCROLL can restore it when updating its
+        // top index. Recheck after native messages; guard the frame update
+        // because it synchronously sends WM_SIZE back to this subclass.
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if ((style & static_cast<LONG_PTR>(WS_VSCROLL)) != 0)
+        {
+            SetPropW(hwnd, kListHidingScrollProp,
+                     reinterpret_cast<HANDLE>(TRUE));
+            ShowScrollBar(hwnd, SB_VERT, FALSE);
+            style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            style &= ~static_cast<LONG_PTR>(WS_VSCROLL);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            RemovePropW(hwnd, kListHidingScrollProp);
+        }
+    }
+}
+
+void PaintListBoxScrollBar(HWND hwnd)
+{
+    const ListScrollMetrics metrics = GetListScrollMetrics(hwnd);
+    if (metrics.bar.right <= metrics.bar.left ||
+        metrics.track.right <= metrics.track.left)
+    {
+        return;
+    }
+
+    HDC dc = GetDC(hwnd);
+    if (dc == nullptr)
+    {
+        return;
+    }
+
+    // The native bar is disabled, so this strip is ours. Filling it first
+    // also masks list text that reaches the right edge.
+    FillColorRect(dc, metrics.bar, kInput);
+    FillRoundColorRect(dc, metrics.track, kPanel,
+                       (metrics.track.right - metrics.track.left) / 2);
+    FillRoundColorRect(dc, metrics.thumb, kBorder,
+                       (metrics.thumb.right - metrics.thumb.left) / 2);
+    ReleaseDC(hwnd, dc);
+}
+
+void InvalidateListBoxScrollBar(HWND hwnd)
+{
+    if (hwnd == nullptr)
+    {
+        return;
+    }
+    // The themed scrollbar lives in the client area.  Invalidate only that
+    // strip and let the normal paint cycle redraw it; forcing RDW_FRAME and
+    // RDW_UPDATENOW causes a visible white/non-client flash while dragging.
+    const ListScrollMetrics metrics = GetListScrollMetrics(hwnd);
+    InvalidateRect(hwnd, &metrics.bar, FALSE);
+}
+
+LRESULT CALLBACK ListBoxSubclassProc(HWND hwnd, UINT message, WPARAM wp,
+                                     LPARAM lp)
+{
+    const WNDPROC original = reinterpret_cast<WNDPROC>(
+        reinterpret_cast<LONG_PTR>(GetPropW(hwnd, kListOrigProcProp)));
+    if (message == WM_STYLECHANGING && wp == static_cast<WPARAM>(GWL_STYLE))
+    {
+        auto* style = reinterpret_cast<STYLESTRUCT*>(lp);
+        style->styleNew &= ~WS_VSCROLL;
+        return 0;
+    }
+    if (message == WM_PAINT)
+    {
+        const LRESULT result = original != nullptr
+            ? CallWindowProcW(original, hwnd, message, wp, lp)
+            : DefWindowProcW(hwnd, message, wp, lp);
+        PaintListBoxScrollBar(hwnd);
+        return result;
+    }
+    if (message == WM_NCPAINT)
+    {
+        // WS_VSCROLL is removed by StyleListBox. Do not let the list-box
+        // window procedure repaint a legacy non-client scrollbar over the
+        // themed client-area strip.
+        return 0;
+    }
+    if (message == WM_ERASEBKGND)
+    {
+        return 1;
+    }
+    if (message == WM_NCDESTROY)
+    {
+        const LRESULT result = original != nullptr
+            ? CallWindowProcW(original, hwnd, message, wp, lp)
+            : DefWindowProcW(hwnd, message, wp, lp);
+        RemovePropW(hwnd, kListOrigProcProp);
+        RemovePropW(hwnd, kListDraggingProp);
+        RemovePropW(hwnd, kListDragOffsetProp);
+        RemovePropW(hwnd, kListHidingScrollProp);
+        return result;
+    }
+
+    if (message == WM_MOUSEWHEEL)
+    {
+        // A list box without WS_VSCROLL no longer lets its default procedure
+        // translate wheel messages. Move the top index directly so hiding
+        // the native bar does not change scrolling behavior.
+        const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        if (delta != 0)
+        {
+            const int magnitude = delta > 0 ? delta : -delta;
+            const int steps = std::max(1, magnitude / WHEEL_DELTA);
+            const int count = std::max(
+                0, static_cast<int>(SendMessageW(hwnd, LB_GETCOUNT, 0, 0)));
+            const int itemHeight = std::max(
+                1, static_cast<int>(SendMessageW(hwnd, LB_GETITEMHEIGHT, 0, 0)));
+            RECT client = {};
+            GetClientRect(hwnd, &client);
+            const int page = std::max(
+                1, static_cast<int>(client.bottom - client.top) / itemHeight);
+            const int maxTop = std::max(0, count - page);
+            int top = static_cast<int>(SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0));
+            for (int i = 0; i < steps; ++i)
+            {
+                top += delta > 0 ? -1 : 1;
+            }
+            SendMessageW(hwnd, LB_SETTOPINDEX,
+                         std::clamp(top, 0, maxTop), 0);
+        }
+        InvalidateListBoxScrollBar(hwnd);
+        return 0;
+    }
+
+    if (message == WM_LBUTTONDOWN)
+    {
+        const ListScrollMetrics metrics = GetListScrollMetrics(hwnd);
+        const POINT point = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (PtInRect(&metrics.bar, point))
+        {
+            if (PtInRect(&metrics.thumb, point))
+            {
+                SetPropW(hwnd, kListDraggingProp,
+                         reinterpret_cast<HANDLE>(TRUE));
+                SetPropW(hwnd, kListDragOffsetProp,
+                         reinterpret_cast<HANDLE>(static_cast<INT_PTR>(
+                             point.y - metrics.thumb.top)));
+                SetCapture(hwnd);
+            }
+            else
+            {
+                const int trackHeight = std::max(
+                    1, static_cast<int>(metrics.track.bottom -
+                                        metrics.track.top));
+                const int thumbHeight = std::max(
+                    1, static_cast<int>(metrics.thumb.bottom -
+                                        metrics.thumb.top));
+                const int travel = std::max(1, trackHeight - thumbHeight);
+                const int maxPosition =
+                    std::max(0, metrics.contentRange - metrics.page);
+                const int target = std::clamp(
+                    static_cast<int>(point.y - metrics.track.top) -
+                        thumbHeight / 2,
+                    0, travel);
+                const int targetPosition = std::clamp(
+                    target * maxPosition / travel,
+                    0, maxPosition);
+                SendMessageW(hwnd, LB_SETTOPINDEX, targetPosition, 0);
+                InvalidateListBoxScrollBar(hwnd);
+            }
+            return 0;
+        }
+    }
+    if (message == WM_MOUSEMOVE &&
+        GetPropW(hwnd, kListDraggingProp) != nullptr)
+    {
+        const ListScrollMetrics metrics = GetListScrollMetrics(hwnd);
+        const int offset = static_cast<int>(reinterpret_cast<INT_PTR>(
+            GetPropW(hwnd, kListDragOffsetProp)));
+        const int trackHeight = std::max(
+            1, static_cast<int>(metrics.track.bottom - metrics.track.top));
+        const int thumbHeight = std::max(
+            1, static_cast<int>(metrics.thumb.bottom - metrics.thumb.top));
+        const int travel = std::max(1, trackHeight - thumbHeight);
+        const int maxPosition =
+            std::max(0, metrics.contentRange - metrics.page);
+        const int thumbPosition = std::clamp(
+            static_cast<int>(GET_Y_LPARAM(lp) - offset -
+                             metrics.track.top),
+            0, travel);
+        const int target = thumbPosition * maxPosition / travel;
+        SendMessageW(hwnd, LB_SETTOPINDEX, target, 0);
+        InvalidateListBoxScrollBar(hwnd);
+        return 0;
+    }
+    if (message == WM_LBUTTONUP || message == WM_CAPTURECHANGED)
+    {
+        if (GetPropW(hwnd, kListDraggingProp) != nullptr)
+        {
+            RemovePropW(hwnd, kListDraggingProp);
+            RemovePropW(hwnd, kListDragOffsetProp);
+            if (GetCapture() == hwnd)
+            {
+                ReleaseCapture();
+            }
+            InvalidateListBoxScrollBar(hwnd);
+            return 0;
+        }
+    }
+
+    const LRESULT result = original != nullptr
+        ? CallWindowProcW(original, hwnd, message, wp, lp)
+        : DefWindowProcW(hwnd, message, wp, lp);
+    switch (message)
+    {
+    case WM_VSCROLL:
+    case WM_KEYDOWN:
+    case WM_LBUTTONUP:
+    case WM_NCLBUTTONUP:
+    case WM_SIZE:
+    case LB_ADDSTRING:
+    case LB_DELETESTRING:
+    case LB_RESETCONTENT:
+    case LB_SETTOPINDEX:
+        HideListBoxNativeScrollBar(hwnd);
+        InvalidateListBoxScrollBar(hwnd);
+        break;
+    default:
+        break;
+    }
+    return result;
 }
 
 }  // namespace
@@ -268,6 +586,20 @@ void StyleCombo(HWND combo)
                       reinterpret_cast<LONG_PTR>(ComboSubclassProc));
 }
 
+void StyleListBox(HWND list)
+{
+    if (list == nullptr || GetPropW(list, kListOrigProcProp) != nullptr)
+    {
+        return;
+    }
+    SetPropW(list, kListOrigProcProp,
+             reinterpret_cast<HANDLE>(GetWindowLongPtrW(list, GWLP_WNDPROC)));
+    SetWindowLongPtrW(list, GWLP_WNDPROC,
+                      reinterpret_cast<LONG_PTR>(ListBoxSubclassProc));
+    HideListBoxNativeScrollBar(list);
+    InvalidateListBoxScrollBar(list);
+}
+
 void SetChecked(HWND checkbox, bool checked)
 {
     SetPropW(checkbox, kCheckedProp,
@@ -301,6 +633,12 @@ void HandleMeasureItem(MEASUREITEMSTRUCT* item)
     {
         item->itemHeight = 56;
     }
+    else if (item != nullptr && item->CtlType == ODT_LISTBOX)
+    {
+        // Keep each preset-tag row tall enough for the dialog font while
+        // allowing the list to remain compact and keyboard friendly.
+        item->itemHeight = 44;
+    }
 }
 
 void HandleDrawItem(const DRAWITEMSTRUCT* item)
@@ -325,9 +663,8 @@ void HandleDrawItem(const DRAWITEMSTRUCT* item)
                 const int trackHeight = 28;
                 const int trackY = rect.top +
                     ((rect.bottom - rect.top) - trackHeight) / 2;
-                RECT track = {rect.left + 2, trackY,
-                              rect.left + 2 + trackWidth,
-                              trackY + trackHeight};
+                RECT track = {rect.right - trackWidth - 2, trackY,
+                              rect.right - 2, trackY + trackHeight};
                 const bool checked =
                     GetPropW(item->hwndItem, kCheckedProp) != nullptr;
                 const COLORREF trackColor = checked ? RGB(55, 104, 78)
@@ -340,7 +677,7 @@ void HandleDrawItem(const DRAWITEMSTRUCT* item)
                              track.bottom - 4};
                 FillRoundColorRect(dc, knob, RGB(225, 235, 228), knobSize / 2);
                 RECT labelRect = rect;
-                labelRect.left = track.right + 14;
+                labelRect.right = track.left - 14;
                 DrawLabel(dc, labelRect, text, kText,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 return;
@@ -422,6 +759,37 @@ void HandleDrawItem(const DRAWITEMSTRUCT* item)
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
+    if (item->CtlType == ODT_LISTBOX)
+    {
+        if (item->itemID == static_cast<UINT>(-1))
+        {
+            return;
+        }
+        wchar_t text[512] = {};
+        SendMessageW(item->hwndItem, LB_GETTEXT, item->itemID,
+                     reinterpret_cast<LPARAM>(text));
+        const bool selected = (item->itemState & ODS_SELECTED) != 0;
+        const COLORREF background = selected ? RGB(4, 57, 94) : kInput;
+        const COLORREF foreground = selected ? RGB(255, 255, 255) : kText;
+        // The native scrollbar stays disabled, so owner-draw
+        // receives the entire client width. Reserve the themed scrollbar
+        // strip explicitly; otherwise every item paints underneath it and
+        // the later scrollbar pass appears to flicker at the right edge.
+        RECT itemRect = rect;
+        itemRect.right = std::max(itemRect.left,
+                                  itemRect.right - kListScrollBarWidth);
+        FillColorRect(dc, itemRect, background);
+        RECT textRect = itemRect;
+        textRect.left += 12;
+        textRect.right -= 12;
+        DrawLabel(dc, textRect, text, foreground,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if ((item->itemState & ODS_FOCUS) != 0)
+        {
+            FrameColorRect(dc, itemRect, kAccent);
+        }
+        return;
+    }
 }
 
 void PaintPanelBackground(HWND hwnd, HDC dc, const RECT& client)
@@ -454,6 +822,16 @@ bool CloseButtonHit(HWND hwnd, POINT point)
                    (kHeaderHeight - kCloseSize) / 2,
                    client.right - 16, (kHeaderHeight + kCloseSize) / 2};
     return PtInRect(&button, point) != FALSE;
+}
+
+void InvalidateCloseButton(HWND hwnd)
+{
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    RECT button = {client.right - kCloseSize - 16,
+                   (kHeaderHeight - kCloseSize) / 2,
+                   client.right - 16, (kHeaderHeight + kCloseSize) / 2};
+    InvalidateRect(hwnd, &button, FALSE);
 }
 
 void PaintBorderlessFrame(HWND hwnd, HDC dc, const wchar_t* title,

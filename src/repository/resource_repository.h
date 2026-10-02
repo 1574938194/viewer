@@ -1,6 +1,7 @@
 #ifndef NEXUS_SRC_REPOSITORY_RESOURCE_REPOSITORY_H_
 #define NEXUS_SRC_REPOSITORY_RESOURCE_REPOSITORY_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -21,6 +22,18 @@ public:
 
     // Loads all resources with their tags joined in.
     std::vector<Resource> LoadAll();
+
+    // Loads a bounded page of media resources after |afterId|.  The result
+    // contains the scalar resource fields needed by background jobs but does
+    // not join tags/actors, keeping startup cache construction cheap.
+    std::vector<Resource> LoadMediaBatch(std::size_t limit,
+                                          ResourceId afterId = 0);
+
+    // Loads media rows that still have one or more derived fields missing.
+    // Pages are ordered by id so a caller can process a large library in
+    // bounded, resumable segments without materialising the whole table.
+    std::vector<Resource> LoadUnfilledBatch(std::size_t limit,
+                                             ResourceId afterId = 0);
 
     // Inserts the resource and fills resource.id. The caller is expected to
     // run inside a transaction and UpdatePath() after archiving.
@@ -51,6 +64,7 @@ public:
         std::uint64_t fileSize = 0;
         std::int64_t modifiedTime = 0;
         std::string contentHash;
+        std::int64_t duration = 0;
     };
 
     std::optional<IndexedFileState> FindIndexedFile(
@@ -59,6 +73,8 @@ public:
     bool UpdateIndexedFile(ResourceId id, std::uint64_t fileSize,
                            std::int64_t modifiedTime,
                            const std::string& contentHash);
+
+    bool UpdateDuration(ResourceId id, std::int64_t duration);
 
     std::optional<ResourceId> FindDuplicate(std::uint64_t fileSize,
                                             const std::string& filename,

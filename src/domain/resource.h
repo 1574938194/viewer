@@ -15,6 +15,7 @@ enum class ResourceType : std::uint8_t
 {
     kVideo,
     kImage,
+    kFolder,
 };
 
 struct Resource

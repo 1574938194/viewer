@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include "render/renderer.h"
 #include "util/string_util.h"
@@ -332,6 +333,9 @@ void ThumbnailService::Shutdown()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_ = true;
+        // Pending decode work is tied to a window that is about to close;
+        // discard it so shutdown does not wait for off-screen thumbnails.
+        queue_.clear();
     }
     cv_.notify_all();
     for (std::thread& worker : workers_)
@@ -353,18 +357,34 @@ void ThumbnailService::Request(const Resource& resource)
     {
         if (it->second.cacheKey != cacheKey)
         {
+            if (!it->second.cacheFile.empty())
+            {
+                cleanupQueue_.push_back(it->second.cacheFile);
+                cv_.notify_one();
+            }
             cache_.erase(it);
             it = cache_.end();
         }
     }
     if (it != cache_.end())
     {
-        it->second.lastUse = ++useCounter_;
-        return;
+        // A failed entry is retryable when the resource becomes available
+        // again (the missing-file worker may have just cleared `missing`).
+        // Keep a missing resource failed without enqueueing one job per
+        // frame.
+        if (resource.missing || it->second.state != State::kFailed ||
+            !it->second.retryWhenAvailable)
+        {
+            it->second.lastUse = ++useCounter_;
+            return;
+        }
+        cache_.erase(it);
     }
 
     Entry& entry = cache_[resource.id];
+    entry.cacheKey = cacheKey;
     entry.state = resource.missing ? State::kFailed : State::kLoading;
+    entry.retryWhenAvailable = resource.missing;
     entry.lastUse = ++useCounter_;
     if (!resource.missing)
     {
@@ -374,7 +394,7 @@ void ThumbnailService::Request(const Resource& resource)
             cacheFile = cacheRoot_ /
                         std::filesystem::path(Utf8ToWide(cacheKey + ".bin"));
         }
-        entry.cacheKey = cacheKey;
+        entry.cacheFile = cacheFile;
         queue_.push_back(
             {resource.id, resource.path, cacheFile, cacheKey, resource.type});
         cv_.notify_one();
@@ -391,6 +411,10 @@ ThumbnailService::State ThumbnailService::StateOf(ResourceId id)
 ID2D1Bitmap* ThumbnailService::BitmapFor(ResourceId id,
                                          render::Renderer* renderer)
 {
+    if (renderer == nullptr)
+    {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cache_.find(id);
     if (it == cache_.end() || it->second.state != State::kReady)
@@ -412,10 +436,51 @@ ID2D1Bitmap* ThumbnailService::BitmapFor(ResourceId id,
     return entry.bitmap.Get();
 }
 
+void ThumbnailService::ResetBitmaps()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [id, entry] : cache_)
+    {
+        (void)id;
+        entry.bitmap = nullptr;
+    }
+}
+
+void ThumbnailService::ClearCache()
+{
+    std::filesystem::path cacheRoot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.clear();
+        cleanupQueue_.clear();
+        cache_.clear();
+        useCounter_ = 0;
+        cacheRoot = cacheRoot_;
+    }
+    if (cacheRoot.empty())
+    {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(cacheRoot, error);
+    error.clear();
+    std::filesystem::create_directories(cacheRoot, error);
+}
+
 void ThumbnailService::Evict(ResourceId id)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    cache_.erase(id);
+    auto it = cache_.find(id);
+    if (it == cache_.end())
+    {
+        return;
+    }
+    if (!it->second.cacheFile.empty())
+    {
+        cleanupQueue_.push_back(it->second.cacheFile);
+        cv_.notify_one();
+    }
+    cache_.erase(it);
 }
 
 void ThumbnailService::Complete(ResourceId id, const std::string& cacheKey,
@@ -431,6 +496,7 @@ void ThumbnailService::Complete(ResourceId id, const std::string& cacheKey,
         }
         Entry& entry = it->second;
         entry.state = State::kReady;
+        entry.retryWhenAvailable = false;
         entry.pixels = std::move(pixels);
         entry.width = width;
         entry.height = height;
@@ -479,16 +545,32 @@ void ThumbnailService::WorkerLoop()
     while (true)
     {
         Job job;
+        std::filesystem::path cleanup;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock,
-                     [this] { return stop_ || !queue_.empty(); });
-            if (stop_ && queue_.empty())
+            cv_.wait(lock, [this] {
+                return stop_ || !queue_.empty() || !cleanupQueue_.empty();
+            });
+            if (queue_.empty() && !cleanupQueue_.empty())
+            {
+                cleanup = std::move(cleanupQueue_.front());
+                cleanupQueue_.pop_front();
+            }
+            else if (stop_ && queue_.empty())
             {
                 break;
             }
-            job = queue_.front();
-            queue_.pop_front();
+            else
+            {
+                job = queue_.front();
+                queue_.pop_front();
+            }
+        }
+        if (!cleanup.empty())
+        {
+            std::error_code error;
+            std::filesystem::remove(cleanup, error);
+            continue;
         }
 
         std::vector<std::uint8_t> pixels;
@@ -523,6 +605,7 @@ void ThumbnailService::WorkerLoop()
                     continue;
                 }
                 it->second.state = State::kFailed;
+                it->second.retryWhenAvailable = false;
             }
             if (hwnd_ != nullptr && IsWindow(hwnd_))
             {

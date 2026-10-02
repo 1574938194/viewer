@@ -88,6 +88,10 @@ void DeleteService::Shutdown()
 
 void DeleteService::Delete(std::vector<DeleteItem> items, DeleteMode mode)
 {
+    if (items.empty())
+    {
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         queue_.push_back({std::move(items), mode});
@@ -127,6 +131,11 @@ void DeleteService::WorkerLoop()
         DeleteBatchResult result;
         for (const DeleteItem& item : request.items)
         {
+            if (!databaseReady)
+            {
+                ++result.failed;
+                continue;
+            }
             std::error_code existenceError;
             const bool sourceExists =
                 std::filesystem::exists(item.path, existenceError);
@@ -134,7 +143,7 @@ void DeleteService::WorkerLoop()
                 (!sourceExists && !existenceError) ||
                 (!existenceError &&
                  DeleteResource(nullptr, item.path, request.mode, nullptr));
-            if (databaseReady && fileReady && resources.Delete(item.id))
+            if (fileReady && resources.Delete(item.id))
             {
                 resources.LogOperation(
                     request.mode == DeleteMode::kPermanent ? "DELETE"

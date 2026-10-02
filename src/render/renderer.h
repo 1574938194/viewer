@@ -51,7 +51,16 @@ public:
 
     void PopClip();
 
+    // Clips drawing to an axis-aligned content viewport. This is separate
+    // from the rounded layer stack because grid viewports are rectangular.
+    void PushRectClip(const D2D1_RECT_F& rect);
+
+    void PopRectClip();
+
     void DrawBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& dest);
+
+    // Rasterizes and caches the embedded application icon at the current size.
+    void DrawIcon(HICON icon, const D2D1_RECT_F& dest);
 
     void DrawTextWide(const std::wstring& text, const D2D1_RECT_F& rect,
                       TextRole role, const D2D1_COLOR_F& color);
@@ -74,8 +83,12 @@ private:
     Microsoft::WRL::ComPtr<ID2D1Factory1> factory_;
     Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> rt_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush_;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> iconBitmap_;
+    HICON cachedIcon_ = nullptr;
+    UINT iconSize_ = 0;
     Microsoft::WRL::ComPtr<ID2D1Layer> clipLayer_;
     int clipDepth_ = 0;
+    int rectClipDepth_ = 0;
     Microsoft::WRL::ComPtr<IDWriteFactory> dwrite_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> formats_[4];
 };

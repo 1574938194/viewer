@@ -36,6 +36,10 @@ LRESULT BorderlessHitTest(HWND hwnd, LPARAM lp);
 // True when the client point is over the header close button.
 bool CloseButtonHit(HWND hwnd, POINT point);
 
+// Invalidates only the custom close button, avoiding child-control redraw
+// flicker when the pointer crosses the header.
+void InvalidateCloseButton(HWND hwnd);
+
 // Paints the header (title + rounded close button) and the panel body.
 void PaintBorderlessFrame(HWND hwnd, HDC dc, const wchar_t* title,
                           bool closeHover);
@@ -57,6 +61,10 @@ void StyleButton(HWND button, bool checkbox);
 void MarkToggle(HWND checkbox);
 
 void StyleCombo(HWND combo);
+
+// Styles a list box with a single, always-visible Nexus dark scrollbar while
+// preserving the native list-box keyboard and mouse-wheel behavior.
+void StyleListBox(HWND list);
 
 void SetChecked(HWND checkbox, bool checked);
 

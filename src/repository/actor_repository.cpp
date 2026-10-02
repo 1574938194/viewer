@@ -1,6 +1,23 @@
 #include "repository/actor_repository.h"
 
+#include "util/string_util.h"
+
 namespace nexus::repo {
+
+namespace {
+
+std::string NormalizeName(std::string value)
+{
+    const size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return {};
+    }
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+}  // namespace
 
 ActorRepository::ActorRepository(db::Database& database) : database_(database)
 {
@@ -8,25 +25,41 @@ ActorRepository::ActorRepository(db::Database& database) : database_(database)
 
 std::int64_t ActorRepository::FindOrCreate(const std::string& name)
 {
+    const std::string normalized = NormalizeName(name);
+    if (normalized.empty())
+    {
+        return 0;
+    }
+    db::Statement find;
+    if (!find.Prepare(database_.handle(),
+                      "SELECT id FROM actors WHERE name=? COLLATE NOCASE;"))
+    {
+        return 0;
+    }
+    find.BindText(1, normalized);
+    if (find.StepRow())
+    {
+        return find.ColumnInt(0);
+    }
     db::Statement insert;
     if (!insert.Prepare(database_.handle(),
                         "INSERT OR IGNORE INTO actors(name) VALUES(?);"))
     {
         return 0;
     }
-    insert.BindText(1, name);
+    insert.BindText(1, normalized);
     if (!insert.StepDone())
     {
         return 0;
     }
-    db::Statement find;
-    if (!find.Prepare(database_.handle(),
-                      "SELECT id FROM actors WHERE name=?;"))
+    db::Statement resolve;
+    if (!resolve.Prepare(database_.handle(),
+                         "SELECT id FROM actors WHERE name=? COLLATE NOCASE;"))
     {
         return 0;
     }
-    find.BindText(1, name);
-    return find.StepRow() ? find.ColumnInt(0) : 0;
+    resolve.BindText(1, normalized);
+    return resolve.StepRow() ? resolve.ColumnInt(0) : 0;
 }
 
 bool ActorRepository::Attach(ResourceId resourceId,
@@ -62,7 +95,7 @@ bool ActorRepository::Detach(ResourceId resourceId,
         return false;
     }
     statement.BindInt(1, static_cast<std::int64_t>(resourceId));
-    statement.BindText(2, actorName);
+    statement.BindText(2, NormalizeName(actorName));
     return statement.StepDone();
 }
 

@@ -1,6 +1,7 @@
 #include "render/renderer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 #include "util/string_util.h"
@@ -66,6 +67,9 @@ bool Renderer::Init(HWND hwnd, float scale)
 
 void Renderer::Shutdown()
 {
+    iconBitmap_ = nullptr;
+    cachedIcon_ = nullptr;
+    iconSize_ = 0;
     for (auto& format : formats_)
     {
         format = nullptr;
@@ -74,6 +78,8 @@ void Renderer::Shutdown()
     rt_ = nullptr;
     dwrite_ = nullptr;
     factory_ = nullptr;
+    clipDepth_ = 0;
+    rectClipDepth_ = 0;
 }
 
 void Renderer::RecreateFormats()
@@ -91,11 +97,10 @@ void Renderer::RecreateFormats()
             continue;
         }
         format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        if (i == static_cast<int>(TextRole::kSearch))
-        {
-            format->SetParagraphAlignment(
-                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        }
+        // Every label is drawn into a fixed-height row (navigation, tags,
+        // status and caption controls).  Center the paragraph vertically so
+        // glyphs sit in the middle of those rows instead of hugging the top.
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         DWRITE_TRIMMING trimming = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0,
                                     0};
         format->SetTrimming(&trimming, nullptr);
@@ -133,7 +138,8 @@ void Renderer::SetScale(float scale)
     {
         format = nullptr;
     }
-    RecreateFormats();}
+    RecreateFormats();
+}
 
 void Renderer::Begin()
 {
@@ -243,6 +249,26 @@ void Renderer::PopClip()
     --clipDepth_;
 }
 
+void Renderer::PushRectClip(const D2D1_RECT_F& rect)
+{
+    if (!rt_)
+    {
+        return;
+    }
+    rt_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    ++rectClipDepth_;
+}
+
+void Renderer::PopRectClip()
+{
+    if (!rt_ || rectClipDepth_ == 0)
+    {
+        return;
+    }
+    rt_->PopAxisAlignedClip();
+    --rectClipDepth_;
+}
+
 void Renderer::DrawBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& dest)
 {
     if (!rt_)
@@ -250,6 +276,53 @@ void Renderer::DrawBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& dest)
         return;
     }
     rt_->DrawBitmap(bitmap, &dest);
+}
+
+void Renderer::DrawIcon(HICON icon, const D2D1_RECT_F& dest)
+{
+    if (!rt_ || icon == nullptr)
+    {
+        return;
+    }
+    const UINT size = static_cast<UINT>(std::clamp(
+        std::ceil(std::max(dest.right - dest.left, dest.bottom - dest.top)),
+        1.0f, 256.0f));
+    if (cachedIcon_ != icon || iconSize_ != size || !iconBitmap_)
+    {
+        BITMAPINFO info = {};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = static_cast<LONG>(size);
+        info.bmiHeader.biHeight = -static_cast<LONG>(size);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* pixels = nullptr;
+        HDC dc = CreateCompatibleDC(nullptr);
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS,
+                                          &pixels, nullptr, 0);
+        if (dc == nullptr || bitmap == nullptr)
+        {
+            if (bitmap != nullptr) DeleteObject(bitmap);
+            if (dc != nullptr) DeleteDC(dc);
+            return;
+        }
+        HGDIOBJ previous = SelectObject(dc, bitmap);
+        std::fill_n(static_cast<std::uint8_t*>(pixels), size * size * 4,
+                    std::uint8_t{0});
+        iconBitmap_ = nullptr;
+        if (DrawIconEx(dc, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL))
+        {
+            GdiFlush();
+            CreateBitmap(size, size, static_cast<const std::uint8_t*>(pixels),
+                         iconBitmap_.GetAddressOf());
+        }
+        SelectObject(dc, previous);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+        cachedIcon_ = icon;
+        iconSize_ = size;
+    }
+    DrawBitmap(iconBitmap_.Get(), dest);
 }
 
 void Renderer::DrawTextWide(const std::wstring& text, const D2D1_RECT_F& rect,

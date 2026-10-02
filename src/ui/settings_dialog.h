@@ -9,7 +9,11 @@ namespace nexus::ui {
 
 class SettingsDialog {
 public:
-    static bool Show(HWND owner, app::Settings* settings);
+    // |clearCacheRequested| is set when the user chooses the safe cache
+    // reset action. It never touches managed-library source files; the caller
+    // owns the database/thumbnail rebuild operation.
+    static bool Show(HWND owner, app::Settings* settings,
+                     bool* clearCacheRequested = nullptr);
 };
 
 }  // namespace nexus::ui

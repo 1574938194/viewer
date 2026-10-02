@@ -48,6 +48,15 @@ public:
     // UI thread only. Returns nullptr while loading or on failure.
     ID2D1Bitmap* BitmapFor(ResourceId id, render::Renderer* renderer);
 
+    // Releases render-target-owned bitmaps while retaining decoded pixels.
+    // Must be called on the UI thread after a renderer/device recreation.
+    void ResetBitmaps();
+
+    // Drops all decoded entries and removes the on-disk thumbnail files. The
+    // caller must stop the service first so no worker can recreate a file
+    // while the directory is being cleared.
+    void ClearCache();
+
     void Evict(ResourceId id);
 
 private:
@@ -67,6 +76,8 @@ private:
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::string cacheKey;
+        std::filesystem::path cacheFile;
+        bool retryWhenAvailable = false;
         Microsoft::WRL::ComPtr<ID2D1Bitmap> bitmap;  // UI thread only
         std::uint64_t lastUse = 0;
     };
@@ -83,6 +94,7 @@ private:
     UINT readyMessage_ = 0;
     std::vector<std::thread> workers_;
     std::deque<Job> queue_;
+    std::deque<std::filesystem::path> cleanupQueue_;
     std::mutex mutex_;
     std::condition_variable cv_;
     bool stop_ = false;

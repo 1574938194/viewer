@@ -86,7 +86,7 @@ const char* const kSchema[] = {
 };
 
 // Version 7 makes the FTS5 index a mandatory part of the on-disk schema.
-// Databases created by the earlier optional-FTS build are upgraded below.
+// Databases created by earlier Nexus builds are upgraded below.
 constexpr int kCurrentVersion = 7;
 
 }  // namespace

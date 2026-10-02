@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <ctime>
+#include <charconv>
+#include <limits>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 
@@ -55,7 +58,11 @@ struct ParsedQuery
     int favorite = -1;
     int openedDays = -1;
     char openedComparator = '<';
+    std::int64_t durationSeconds = -1;
+    char durationComparator = '=';
 };
+
+bool ParseDurationValue(std::string value, std::int64_t* seconds);
 
 struct ScoredResource
 {
@@ -138,6 +145,23 @@ ParsedQuery Parse(const std::wstring& query)
             catch (...)
             {
                 parsed.openedDays = -1;
+            }
+            continue;
+        }
+        if (token.starts_with("duration:"))
+        {
+            std::string value = token.substr(9);
+            if (!value.empty() && (value.front() == '<' ||
+                                   value.front() == '>' ||
+                                   value.front() == '='))
+            {
+                parsed.durationComparator = value.front();
+                value.erase(value.begin());
+            }
+            std::int64_t seconds = 0;
+            if (ParseDurationValue(value, &seconds))
+            {
+                parsed.durationSeconds = seconds;
             }
             continue;
         }
@@ -243,6 +267,76 @@ std::string BuildFtsQuery(const ParsedQuery& parsed,
     return result;
 }
 
+bool MatchesFilenameSubstring(const Resource& resource,
+                              const ParsedQuery& parsed)
+{
+    for (const QueryTerm& term : parsed.terms)
+    {
+        if (term.excluded || term.field != QueryTerm::Field::kAny ||
+            term.text.empty())
+        {
+            continue;
+        }
+        if (AsciiLower(resource.originalFilename).find(term.text) !=
+                std::string::npos ||
+            AsciiLower(resource.title).find(term.text) != std::string::npos ||
+            AsciiLower(resource.code).find(term.text) != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ParseInteger(std::string_view text, std::int64_t* value)
+{
+    if (text.empty() || value == nullptr)
+    {
+        return false;
+    }
+    std::int64_t parsed = 0;
+    const auto [end, error] = std::from_chars(
+        text.data(), text.data() + text.size(), parsed);
+    if (error != std::errc() || end != text.data() + text.size() ||
+        parsed < 0)
+    {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+bool ParseDurationValue(std::string value, std::int64_t* seconds)
+{
+    if (value.empty() || seconds == nullptr)
+    {
+        return false;
+    }
+    std::int64_t multiplier = 1;
+    if (value.ends_with('s'))
+    {
+        value.pop_back();
+    }
+    else if (value.ends_with('m'))
+    {
+        value.pop_back();
+        multiplier = 60;
+    }
+    else if (value.ends_with('h'))
+    {
+        value.pop_back();
+        multiplier = 60 * 60;
+    }
+    std::int64_t amount = 0;
+    if (!ParseInteger(value, &amount) ||
+        amount > std::numeric_limits<std::int64_t>::max() / multiplier)
+    {
+        return false;
+    }
+    *seconds = amount * multiplier;
+    return true;
+}
+
 int MatchRelevance(const Resource& resource, const std::string& token,
                    QueryTerm::Field field, const AliasResolver& resolveAlias)
 {
@@ -330,7 +424,12 @@ std::vector<const Resource*> SearchService::Search(
     std::vector<ScoredResource> scored;
     for (const Resource& resource : resources)
     {
-        if (!candidates.contains(resource.id))
+        // unicode61 tokenizes a Chinese filename such as “销售经理照片” as
+        // one token, so FTS cannot return a contains-search for “经理”. Keep
+        // FTS as the primary candidate source and supplement it only with a
+        // cheap filename/title/code substring check for unqualified terms.
+        if (!candidates.contains(resource.id) &&
+            !MatchesFilenameSubstring(resource, parsed))
         {
             continue;
         }
@@ -354,12 +453,30 @@ std::vector<const Resource*> SearchService::Search(
             const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
             const std::int64_t threshold = now -
                 static_cast<std::int64_t>(parsed.openedDays) * 86400;
+            if (resource.lastOpenTime == 0)
+            {
+                continue;
+            }
             const bool matches = parsed.openedComparator == '>'
                 ? resource.lastOpenTime < threshold
                 : parsed.openedComparator == '='
                     ? resource.lastOpenTime >= threshold &&
                       resource.lastOpenTime < threshold + 86400
                     : resource.lastOpenTime >= threshold;
+            if (!matches)
+            {
+                continue;
+            }
+        }
+        if (parsed.durationSeconds >= 0)
+        {
+            const std::int64_t duration = resource.duration;
+            const std::int64_t target = parsed.durationSeconds;
+            const bool matches = parsed.durationComparator == '>'
+                ? duration > target
+                : parsed.durationComparator == '<'
+                    ? duration < target
+                    : duration == target;
             if (!matches)
             {
                 continue;

@@ -28,6 +28,7 @@ struct GridView
     D2D1_RECT_F content = {};  // area available to the grid, in pixels
     float scrollY = 0.0f;
     float scale = 1.0f;
+    std::optional<D2D1_RECT_F> selectionRect;
 };
 
 // Virtualized thumbnail grid (design doc section 54): only visible cards are
@@ -44,6 +45,14 @@ public:
     static float ContentHeight(const GridView& view);
 
     static std::optional<ResourceId> HitTest(const GridView& view, POINT point);
+
+    static std::optional<ResourceId> HitTestFavorite(const GridView& view,
+                                                      POINT point);
+
+    // rect is in content coordinates (viewport origin removed, scroll added).
+    // Includes cards outside the visible viewport for cross-screen selection.
+    static std::vector<ResourceId> HitTestRect(const GridView& view,
+                                               const D2D1_RECT_F& rect);
 
     static void Draw(render::Renderer* renderer, const GridView& view,
                      service::ThumbnailService* thumbnails);

@@ -17,7 +17,7 @@ public:
     static std::optional<service::ImportMetadata> Show(
         HWND owner, const std::vector<std::filesystem::path>& files,
         const std::vector<std::string>& categories,
-        const std::vector<std::string>& recentTags,
+        const std::vector<std::string>& quickTags,
         const service::ImportMetadata* initial = nullptr,
         bool editMode = false);
 };

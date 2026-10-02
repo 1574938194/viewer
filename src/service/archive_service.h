@@ -4,7 +4,9 @@
 #include <filesystem>
 #include <functional>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #include "domain/resource.h"
 
@@ -40,18 +42,36 @@ public:
     bool Rollback(const std::filesystem::path& source,
                   const ArchiveResult& archive);
 
-    const std::filesystem::path& library_root() const { return libraryRoot_; }
+    std::filesystem::path library_root() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return libraryRoot_;
+    }
+
+    void SetLibraryRoot(std::filesystem::path libraryRoot)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        libraryRoot_ = std::move(libraryRoot);
+    }
 
     std::filesystem::path ManagedPath(ResourceId id, ResourceType type,
                                       const std::wstring& extension) const;
 
 private:
-    bool EnsureDirectories(ResourceType type);
+    bool EnsureDirectories(ResourceType type,
+                           const std::filesystem::path& libraryRoot);
 
     static bool SameVolume(const std::filesystem::path& a,
                            const std::filesystem::path& b);
 
+    std::filesystem::path LibraryRootSnapshot() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return libraryRoot_;
+    }
+
     std::filesystem::path libraryRoot_;
+    mutable std::mutex mutex_;
 };
 
 }  // namespace nexus::service

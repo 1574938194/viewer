@@ -2,8 +2,11 @@
 
 #include <Windows.h>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "util/string_util.h"
 
@@ -78,7 +81,42 @@ std::string Escape(std::string value)
     return escaped;
 }
 
+std::string TrimTag(std::string value)
+{
+    const size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return {};
+    }
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+void AppendUniqueTag(std::vector<std::string>* tags, std::string value)
+{
+    if (tags == nullptr)
+    {
+        return;
+    }
+    value = TrimTag(std::move(value));
+    if (value.empty() ||
+        std::find(tags->begin(), tags->end(), value) != tags->end())
+    {
+        return;
+    }
+    tags->push_back(std::move(value));
+}
+
 }  // namespace
+
+void Settings::set_presetTags(std::vector<std::string> value)
+{
+    presetTags_.clear();
+    for (std::string& tag : value)
+    {
+        AppendUniqueTag(&presetTags_, std::move(tag));
+    }
+}
 
 bool Settings::Load(const std::filesystem::path& file)
 {
@@ -87,6 +125,17 @@ bool Settings::Load(const std::filesystem::path& file)
     {
         return false;
     }
+    // Loading replaces the complete settings snapshot.  This matters when a
+    // caller reuses a Settings instance after a previous customisation: an
+    // omitted key must receive the same defaults as a first launch rather
+    // than retaining stale values from the old snapshot.
+    videoPlayer_.clear();
+    imageViewer_.clear();
+    managedLibrary_.clear();
+    deleteSourceAfterImport_ = true;
+    askMetadataOnDrop_ = true;
+    presetTags_ = {"白丝", "美少女", "萝莉", "3p", "肛交", "内射"};
+    bool presetTagsSeen = false;
     std::string line;
     while (std::getline(input, line))
     {
@@ -110,9 +159,37 @@ bool Settings::Load(const std::filesystem::path& file)
         {
             imageViewer_ = Utf8ToWide(value);
         }
+        else if (key == "managed_library")
+        {
+            managedLibrary_ = Utf8ToWide(value);
+        }
         else if (key == "delete_source_after_import")
         {
             deleteSourceAfterImport_ = value == "true" || value == "1";
+        }
+        else if (key == "ask_metadata_on_drop")
+        {
+            askMetadataOnDrop_ = value != "false" && value != "0";
+        }
+        else if (key == "preset_tags")
+        {
+            // The value is an empty TOML array marker. Individual tags are
+            // stored on following preset_tag lines so arbitrary Unicode text
+            // can use the same escaping rules as the other settings.
+            if (!presetTagsSeen)
+            {
+                presetTags_.clear();
+                presetTagsSeen = true;
+            }
+        }
+        else if (key == "preset_tag")
+        {
+            if (!presetTagsSeen)
+            {
+                presetTags_.clear();
+                presetTagsSeen = true;
+            }
+            AppendUniqueTag(&presetTags_, value);
         }
     }
     return true;
@@ -120,11 +197,19 @@ bool Settings::Load(const std::filesystem::path& file)
 
 bool Settings::Save(const std::filesystem::path& file) const
 {
-    std::error_code error;
-    std::filesystem::create_directories(file.parent_path(), error);
-    if (error)
+    if (file.empty())
     {
         return false;
+    }
+    std::error_code error;
+    const std::filesystem::path parent = file.parent_path();
+    if (!parent.empty())
+    {
+        std::filesystem::create_directories(parent, error);
+        if (error)
+        {
+            return false;
+        }
     }
     const std::filesystem::path temporary =
         file.wstring() + L".tmp-" + std::to_wstring(GetCurrentProcessId());
@@ -133,13 +218,22 @@ bool Settings::Save(const std::filesystem::path& file) const
     {
         return false;
     }
-    output << "# Nexus settings\n";
+    output << "# Viewer settings\n";
     output << "video_player = \"" << Escape(WideToUtf8(videoPlayer_))
            << "\"\n";
     output << "image_viewer = \"" << Escape(WideToUtf8(imageViewer_))
            << "\"\n";
+    output << "managed_library = \""
+           << Escape(WideToUtf8(managedLibrary_)) << "\"\n";
     output << "delete_source_after_import = "
            << (deleteSourceAfterImport_ ? "true" : "false") << "\n";
+    output << "ask_metadata_on_drop = "
+           << (askMetadataOnDrop_ ? "true" : "false") << "\n";
+    output << "preset_tags = []\n";
+    for (const std::string& tag : presetTags_)
+    {
+        output << "preset_tag = \"" << Escape(tag) << "\"\n";
+    }
     if (!output.good())
     {
         output.close();

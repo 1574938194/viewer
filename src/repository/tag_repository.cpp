@@ -4,13 +4,33 @@
 
 namespace nexus::repo {
 
+namespace {
+
+std::string NormalizeName(std::string value)
+{
+    const size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return {};
+    }
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    value = value.substr(first, last - first + 1);
+    return AsciiLower(value);
+}
+
+}  // namespace
+
 TagRepository::TagRepository(db::Database& database) : database_(database)
 {
 }
 
 std::int64_t TagRepository::FindOrCreate(const std::string& name)
 {
-    const std::string normalized = AsciiLower(name);
+    const std::string normalized = NormalizeName(name);
+    if (normalized.empty())
+    {
+        return 0;
+    }
     db::Statement find;
     if (!find.Prepare(database_.handle(),
                       "SELECT id FROM tags WHERE name = ?;"))
@@ -53,7 +73,7 @@ std::vector<std::string> TagRepository::ResolveWord(const std::string& word)
                       "SELECT t.name FROM tag_alias a"
                       " JOIN tags t ON t.id = a.tag_id WHERE a.alias = ?;"))
     {
-        alias.BindText(1, AsciiLower(word));
+        alias.BindText(1, NormalizeName(word));
         while (alias.StepRow())
         {
             names.push_back(alias.ColumnText(0));
@@ -64,7 +84,7 @@ std::vector<std::string> TagRepository::ResolveWord(const std::string& word)
     if (exact.Prepare(database_.handle(),
                       "SELECT name FROM tags WHERE name = ?;"))
     {
-        exact.BindText(1, AsciiLower(word));
+        exact.BindText(1, NormalizeName(word));
         if (exact.StepRow())
         {
             names.push_back(exact.ColumnText(0));
@@ -76,8 +96,9 @@ std::vector<std::string> TagRepository::ResolveWord(const std::string& word)
 bool TagRepository::SetAlias(const std::string& alias,
                              const std::string& tagName)
 {
+    const std::string normalizedAlias = NormalizeName(alias);
     const std::int64_t tagId = FindOrCreate(tagName);
-    if (tagId == 0)
+    if (tagId == 0 || normalizedAlias.empty())
     {
         return false;
     }
@@ -89,7 +110,7 @@ bool TagRepository::SetAlias(const std::string& alias,
     {
         return false;
     }
-    statement.BindText(1, AsciiLower(alias));
+    statement.BindText(1, normalizedAlias);
     statement.BindInt(2, tagId);
     return statement.StepDone();
 }
@@ -123,7 +144,7 @@ void TagRepository::Detach(ResourceId resourceId, const std::string& tagName)
         return;
     }
     statement.BindInt(1, static_cast<std::int64_t>(resourceId));
-    statement.BindText(2, AsciiLower(tagName));
+    statement.BindText(2, NormalizeName(tagName));
     statement.StepDone();
 }
 

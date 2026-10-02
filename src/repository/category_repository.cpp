@@ -1,6 +1,23 @@
 #include "repository/category_repository.h"
 
+#include "util/string_util.h"
+
 namespace nexus::repo {
+
+namespace {
+
+std::string NormalizeName(std::string value)
+{
+    const size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return {};
+    }
+    const size_t last = value.find_last_not_of(" \t\r\n");
+    return AsciiLower(value.substr(first, last - first + 1));
+}
+
+}  // namespace
 
 CategoryRepository::CategoryRepository(db::Database& database)
     : database_(database)
@@ -9,26 +26,44 @@ CategoryRepository::CategoryRepository(db::Database& database)
 
 std::int64_t CategoryRepository::FindOrCreate(const std::string& name)
 {
+    const std::string normalized = NormalizeName(name);
+    if (normalized.empty())
+    {
+        return 0;
+    }
+    db::Statement find;
+    if (!find.Prepare(database_.handle(),
+                      "SELECT id FROM categories WHERE name = ?"
+                      " COLLATE NOCASE;"))
+    {
+        return 0;
+    }
+    find.BindText(1, normalized);
+    if (find.StepRow())
+    {
+        return find.ColumnInt(0);
+    }
     db::Statement insert;
     if (!insert.Prepare(database_.handle(),
                         "INSERT OR IGNORE INTO categories(name) VALUES(?);"))
     {
         return 0;
     }
-    insert.BindText(1, name);
+    insert.BindText(1, normalized);
     if (!insert.StepDone())
     {
         return 0;
     }
 
-    db::Statement find;
-    if (!find.Prepare(database_.handle(),
-                      "SELECT id FROM categories WHERE name = ?;"))
+    db::Statement resolve;
+    if (!resolve.Prepare(database_.handle(),
+                         "SELECT id FROM categories WHERE name = ?"
+                         " COLLATE NOCASE;"))
     {
         return 0;
     }
-    find.BindText(1, name);
-    return find.StepRow() ? find.ColumnInt(0) : 0;
+    resolve.BindText(1, normalized);
+    return resolve.StepRow() ? resolve.ColumnInt(0) : 0;
 }
 
 bool CategoryRepository::Assign(ResourceId resourceId,

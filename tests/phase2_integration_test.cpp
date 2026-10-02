@@ -68,8 +68,19 @@ int main()
 {
     TempDirectory temp;
     nexus::app::Settings settings;
+    if (!Check(settings.presetTags().size() == 6,
+               "default preset tags were not installed") ||
+        !Check(settings.presetTags()[0] == "白丝" &&
+                   settings.presetTags()[5] == "内射",
+               "default preset tag values are incorrect"))
+    {
+        return 1;
+    }
     settings.set_videoPlayer(L"C:\\播放器\\video \"custom\".exe");
     settings.set_imageViewer(L"");
+    settings.set_managedLibrary(L"D:\\NexusLibrary");
+    settings.set_askMetadataOnDrop(false);
+    settings.set_presetTags({" 白丝 ", "自定义", "自定义", ""});
     const std::filesystem::path settingsPath = temp.path() / L"nexus.toml";
     if (!Check(settings.Save(settingsPath), "settings save failed"))
     {
@@ -81,7 +92,14 @@ int main()
                    L"C:\\播放器\\video \"custom\".exe",
                "settings video player roundtrip failed") ||
         !Check(loadedSettings.imageViewer().empty(),
-               "settings empty viewer roundtrip failed"))
+               "settings empty viewer roundtrip failed") ||
+        !Check(loadedSettings.managedLibrary() == L"D:\\NexusLibrary",
+               "settings managed library roundtrip failed") ||
+        !Check(!loadedSettings.askMetadataOnDrop(),
+               "settings metadata prompt roundtrip failed") ||
+        !Check(loadedSettings.presetTags() ==
+                   std::vector<std::string>{"白丝", "自定义"},
+               "settings preset tags roundtrip failed"))
     {
         return 1;
     }
@@ -253,6 +271,7 @@ int main()
     resource.title = "source";
     resource.fileSize = std::filesystem::file_size(source);
     resource.contentHash = *sourceHash;
+    resource.duration = 90;
     resource.modifiedTime = 1;
 
     if (!Check(database.Exec("BEGIN;"), "transaction begin failed") ||
@@ -320,6 +339,13 @@ int main()
     {
         return 1;
     }
+    if (!Check(tags.FindOrCreate("  UNIFORM  ") ==
+                   tags.FindOrCreate("uniform"),
+               "tag whitespace normalization failed") ||
+        !Check(tags.FindOrCreate("   ") == 0, "empty tag was accepted"))
+    {
+        return 1;
+    }
     const std::filesystem::path populatedBackup = temp.path() / L"populated.db";
     if (!Check(database.BackupTo(populatedBackup), "populated backup failed"))
     {
@@ -335,6 +361,10 @@ int main()
     populated.Close();
     const std::int64_t categoryId = categories.FindOrCreate("collection");
     if (!Check(categoryId != 0, "category create failed") ||
+        !Check(categories.FindOrCreate(" Collection ") == categoryId,
+               "category normalization failed") ||
+        !Check(actors.FindOrCreate(" Alice ") != 0,
+               "actor whitespace normalization failed") ||
         !Check(categories.Assign(resource.id, categoryId),
                "category assign failed") ||
         !Check(actors.Attach(resource.id, "Alice"), "actor attach failed"))
@@ -445,6 +475,21 @@ int main()
         return 1;
     }
     if (!Check(nexus::service::SearchService::Search(
+                   resources, searchable, L"duration:>1m", resolve)
+                       .size() == 1,
+               "duration greater-than filter failed") ||
+        !Check(nexus::service::SearchService::Search(
+                   resources, searchable, L"duration:<2m", resolve)
+                       .size() == 1,
+               "duration less-than filter failed") ||
+        !Check(nexus::service::SearchService::Search(
+                   resources, searchable, L"duration:>2m", resolve)
+                       .empty(),
+               "duration upper bound filter failed"))
+    {
+        return 1;
+    }
+    if (!Check(nexus::service::SearchService::Search(
                    resources, searchable, L"\"source\"", resolve)
                        .size() == 1,
                "quoted phrase search failed"))
@@ -477,6 +522,29 @@ int main()
                    resources, searchable, L"type:video type:image", resolve)
                        .empty(),
                "conflicting type filters were not rejected"))
+    {
+        return 1;
+    }
+    nexus::Resource untagged;
+    untagged.type = nexus::ResourceType::kImage;
+    untagged.path = temp.path() / L"untagged.jpg";
+    untagged.originalFilename = "untagged.jpg";
+    untagged.title = "uniform-search-fallback";
+    if (!Check(resources.Insert(untagged),
+               "required tag search fixture insert failed"))
+    {
+        return 1;
+    }
+    const std::vector<nexus::Resource> withUntagged = resources.LoadAll();
+    if (!Check(nexus::service::SearchService::Search(
+                   resources, withUntagged, L"+tag:uniform fallback", resolve)
+                       .size() == 1,
+               "required tag filter was not enforced"))
+    {
+        return 1;
+    }
+    if (!Check(resources.Delete(untagged.id),
+               "required tag search fixture cleanup failed"))
     {
         return 1;
     }
@@ -572,6 +640,56 @@ int main()
         return 1;
     }
 
+    const std::filesystem::path folderSource = importRoot / L"folder batch";
+    const std::filesystem::path nestedFolder = folderSource / L"nested";
+    std::filesystem::create_directories(nestedFolder);
+    const std::filesystem::path folderImage =
+        folderSource / L"folder-one.jpg";
+    const std::filesystem::path nestedImage =
+        nestedFolder / L"folder-two.png";
+    {
+        std::ofstream output(folderImage, std::ios::binary);
+        output << "folder import fixture one";
+    }
+    {
+        std::ofstream output(nestedImage, std::ios::binary);
+        output << "folder import fixture two";
+    }
+    {
+        std::ofstream output(folderSource / L"ignored.txt", std::ios::binary);
+        output << "unsupported";
+    }
+    nexus::service::ImportService folderImporter(importDatabasePath,
+                                                 importArchive);
+    nexus::service::ImportMetadata folderMetadata;
+    folderMetadata.deleteSource = false;
+    folderImporter.Start(nullptr, 0);
+    folderImporter.Import({folderSource}, folderMetadata);
+    for (int attempt = 0; attempt < 100 && importedResources.Count() < 3;
+         ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    folderImporter.Shutdown();
+    const std::vector<nexus::Resource> folderResources =
+        importedResources.LoadAll();
+    int folderTagged = 0;
+    for (const nexus::Resource& folderResource : folderResources)
+    {
+        if (std::find(folderResource.tags.begin(), folderResource.tags.end(),
+                      "folder batch") != folderResource.tags.end())
+        {
+            ++folderTagged;
+        }
+    }
+    if (!Check(folderResources.size() == 3,
+               "directory import did not archive every supported file") ||
+        !Check(folderTagged == 2,
+               "directory name was not attached as a collective tag"))
+    {
+        return 1;
+    }
+
     std::vector<nexus::service::DeleteItem> pendingDeletes;
     for (int index = 0; index < 2; ++index)
     {
@@ -609,7 +727,7 @@ int main()
         !Check(deleteResults[0].deleted.size() == 2 &&
                    deleteResults[0].failed == 0,
                "batch delete result counts are incorrect") ||
-        !Check(importedResources.Count() == 1,
+        !Check(importedResources.Count() == 3,
                "batch delete removed wrong database rows") ||
         !Check(!std::filesystem::exists(pendingDeletes[0].path) &&
                    !std::filesystem::exists(pendingDeletes[1].path),
@@ -634,6 +752,81 @@ int main()
     {
         return 1;
     }
+    const std::filesystem::path lightweightRoot =
+        temp.path() / L"lightweight-library";
+    const std::filesystem::path lightweightDatabasePath =
+        temp.path() / L"lightweight-data" / L"nexus.db";
+    const std::filesystem::path lightweightFile =
+        lightweightRoot / L"image" / L"preview-card.jpg";
+    std::filesystem::create_directories(lightweightFile.parent_path());
+    {
+        std::ofstream output(lightweightFile, std::ios::binary);
+        output << "lightweight card fixture";
+    }
+    const nexus::service::ScanResult lightweight =
+        nexus::service::ScanService::RunLightweight(
+            lightweightDatabasePath, lightweightRoot);
+    nexus::db::Database lightweightDatabase;
+    nexus::repo::ResourceRepository lightweightResources(lightweightDatabase);
+    if (!Check(lightweightDatabase.Open(lightweightDatabasePath),
+               "lightweight database reopen failed"))
+    {
+        return 1;
+    }
+    const std::vector<nexus::Resource> lightweightItems =
+        lightweightResources.LoadAll();
+    if (!Check(lightweight.added == 1 && lightweightItems.size() == 1,
+               "lightweight scan did not add a card row") ||
+        !Check(lightweightItems[0].title == "preview-card" &&
+                   lightweightItems[0].contentHash.empty(),
+               "lightweight scan did not defer expensive metadata"))
+    {
+        return 1;
+    }
+    const nexus::service::ScanResult enriched =
+        nexus::service::ScanService::Run(lightweightDatabasePath,
+                                         lightweightRoot);
+    const std::vector<nexus::Resource> enrichedItems =
+        lightweightResources.LoadAll();
+    if (!Check(enriched.updated == 1 && enrichedItems.size() == 1 &&
+                   !enrichedItems[0].contentHash.empty(),
+               "full scan did not enrich lightweight card metadata"))
+    {
+        return 1;
+    }
+    lightweightDatabase.Close();
+
+    const std::filesystem::path tsRoot = temp.path() / L"ts-library";
+    const std::filesystem::path tsDatabasePath =
+        temp.path() / L"ts-data" / L"nexus.db";
+    const std::filesystem::path tsFile = tsRoot / L"video.ts";
+    std::filesystem::create_directories(tsRoot);
+    {
+        std::ofstream output(tsFile, std::ios::binary);
+        output << "transport stream fixture";
+    }
+    const nexus::service::ScanResult tsScan =
+        nexus::service::ScanService::RunLightweight(tsDatabasePath, tsRoot);
+    nexus::db::Database tsDatabase;
+    if (!Check(tsDatabase.Open(tsDatabasePath),
+               "ts database reopen failed"))
+    {
+        return 1;
+    }
+    nexus::repo::ResourceRepository tsResources(tsDatabase);
+    const std::vector<nexus::Resource> tsItems = tsResources.LoadAll();
+    if (!Check(tsScan.added == 1 && tsItems.size() == 1 &&
+                   tsItems[0].type == nexus::ResourceType::kVideo,
+               "lightweight scan did not index .ts video") ||
+        !Check(nexus::service::SearchService::Search(
+                   tsResources, tsItems, L".ts", {})
+                       .size() == 1,
+               ".ts video was not returned by search"))
+    {
+        return 1;
+    }
+    tsDatabase.Close();
+
     const std::filesystem::path orphan = scanRoot / L"image" / L"00" /
                                          L"000000000099.jpg";
     const std::filesystem::path incoming = scanRoot / L".incoming" /
